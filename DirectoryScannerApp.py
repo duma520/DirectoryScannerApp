@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QCheckBox, QFileDialog, QTabWidget, QGridLayout, QGroupBox,
                              QDateEdit, QToolButton, QSizePolicy, QStackedWidget, QAction,
                              QMenu, QSystemTrayIcon, QScrollArea, QInputDialog, QFrame, 
-                             QTextEdit)
+                             QTextEdit, QProgressDialog, QProgressBar)
 from PyQt5.QtCore import Qt, QTimer, QDateTime, QSize, QSettings, pyqtSignal
 from PyQt5.QtGui import (QIcon, QColor, QFont, QPixmap, QBrush, QColor, QPixmap)
 from PyQt5.QtSql import QSqlDatabase, QSqlQuery, QSqlTableModel
@@ -32,7 +32,7 @@ if pinyin_available:
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "2.33.0"
+    VERSION = "2.42.0"
     BUILD_DATE = "2025-11-03"
     # from datetime import datetime
     # BUILD_DATE = datetime.now().strftime("%Y-%m-%d")  # 修改为动态获取当前日期
@@ -46,6 +46,7 @@ class ProjectInfo:
 
     # 补充完整的版本历史
     VERSION_HISTORY = {
+        "2.42.0": "增强保存封面，扫描进度条",
         "2.33.0": "增强图片点击查看功能",
         "2.27.0": "增强拼音搜索功能，优化数据库性能，修复扫描模式设置问题",
         "2.8.0": "添加多用户支持，改进UI界面，增加主目录管理功能",
@@ -59,7 +60,7 @@ class ProjectInfo:
     HELP_TEXT = """
 使用说明:
 
-版本: 2.33.0
+版本: 2.42.0
 作者: 杜玛
 
 主要功能:
@@ -1405,7 +1406,7 @@ class UserManagerDialog(QDialog):
 
 
 
-# 设置对话框
+# 设置对话框 （每个用户独立保存所有设置）
 class SettingsDialog(QDialog):
     def __init__(self, user_manager, parent=None):
         super().__init__(parent)
@@ -1491,20 +1492,98 @@ class SettingsDialog(QDialog):
         scan_tab.setLayout(scan_layout)
         tabs.addTab(scan_tab, "扫描设置")
         
-        # 显示设置
+        # 其他设置（每个用户独立保存所有设置）
         display_tab = QWidget()
         display_layout = QVBoxLayout()
         
-        # 显示列
-        columns_group = QGroupBox("显示列设置")
+        # 封面相关设置
+        columns_group = QGroupBox("封面相关设置")
         columns_layout = QVBoxLayout()
+
+        # === 新增：扫描时保存封面设置 ===
+        scan_save_layout = QHBoxLayout()
+        scan_save_layout.addWidget(QLabel("扫描时保存封面:"))
+
+        self.scan_save_cover = QCheckBox("开启时每次扫描自动保存封面")
+        self.scan_save_cover.setToolTip("开启后，每次扫描目录时会自动保存封面图片")
+        scan_save_layout.addWidget(self.scan_save_cover)
+        scan_save_layout.addStretch()
+
+        columns_layout.addLayout(scan_save_layout)
+
+        # === 新增：封面备份存在则跳过 ===
+        cover_skip_layout = QHBoxLayout()
+        cover_skip_layout.addWidget(QLabel("封面备份存在则跳过:"))
+
+        self.skip_existing_covers = QCheckBox("开启时如果封面备份已存在则跳过保存")
+        self.skip_existing_covers.setToolTip("开启后，扫描时如果封面备份已经存在，则跳过保存该封面")
+        self.skip_existing_covers.setChecked(True)  # 默认开启
+        cover_skip_layout.addWidget(self.skip_existing_covers)
+        cover_skip_layout.addStretch()
+
+        columns_layout.addLayout(cover_skip_layout)
+
+        # === 新增：封面保存模式设置 ===
+        cover_mode_layout = QHBoxLayout()
+        cover_mode_layout.addWidget(QLabel("封面保存模式:"))
         
+        self.cover_save_mode = QComboBox()
+        self.cover_save_mode.addItem("智能模式", "smart")
+        self.cover_save_mode.addItem("系列模式", "series")  
+        self.cover_save_mode.addItem("首字模式", "first_char")
+        cover_mode_layout.addWidget(self.cover_save_mode)
+        cover_mode_layout.addStretch()
         
+        columns_layout.addLayout(cover_mode_layout)
+        
+        # === 新增：封面保存目录设置 ===
+        cover_dir_layout = QHBoxLayout()
+        cover_dir_layout.addWidget(QLabel("封面保存目录:"))
+        
+        self.cover_save_dir = QLineEdit()
+        self.cover_save_dir.setPlaceholderText("留空则使用默认目录: ~/目录封面")
+        
+        cover_browse_btn = QPushButton("浏览...")
+        cover_browse_btn.clicked.connect(self.browse_cover_save_dir)
+        cover_dir_layout.addWidget(self.cover_save_dir)
+        cover_dir_layout.addWidget(cover_browse_btn)
+        
+        columns_layout.addLayout(cover_dir_layout)
+        
+        # === 新增：封面保存说明 ===
+        cover_info_label = QLabel(
+            "封面保存说明:\n"
+            "• 智能模式: 自动识别AV格式使用系列模式，其他使用首字模式\n"
+            "• 系列模式: 按XXXX-####格式建立系列目录\n"  
+            "• 首字模式: 按名称首字母建立目录"
+        )
+        cover_info_label.setStyleSheet("color: #666; font-size: 11px;")
+        columns_layout.addWidget(cover_info_label)
+
+        # === 新增：批量操作按钮 ===
+        batch_buttons_layout = QHBoxLayout()
+
+        batch_save_all_btn = QPushButton("批量保存所有封面")
+        batch_save_all_btn.clicked.connect(self.batch_save_all_covers)
+        batch_save_all_btn.setToolTip("为所有已扫描目录保存封面图片")
+
+        batch_save_missing_btn = QPushButton("只保存缺失封面")
+        batch_save_missing_btn.clicked.connect(self.batch_save_missing_covers)
+        batch_save_missing_btn.setToolTip("只为缺少封面的目录保存封面")
+
+        batch_buttons_layout.addWidget(batch_save_all_btn)
+        batch_buttons_layout.addWidget(batch_save_missing_btn)
+        batch_buttons_layout.addStretch()
+
+        columns_layout.addLayout(batch_buttons_layout)
+
+
+
         columns_group.setLayout(columns_layout)
         display_layout.addWidget(columns_group)
         display_layout.addStretch()
         display_tab.setLayout(display_layout)
-        tabs.addTab(display_tab, "显示设置")
+        tabs.addTab(display_tab, "其他设置")
         
         layout.addWidget(tabs)
         
@@ -1523,7 +1602,26 @@ class SettingsDialog(QDialog):
         layout.addLayout(button_layout)
         
         self.setLayout(layout)
-    
+
+    def batch_save_all_covers(self):
+        """调用主窗口的批量保存所有封面方法"""
+        if hasattr(self, 'parent') and self.parent():
+            self.parent().batch_save_all_covers()
+
+    def batch_save_missing_covers(self):
+        """只为缺少封面的目录保存封面"""
+        if not self.user_manager.current_db_path:
+            QMessageBox.warning(self, "未登录", "请先登录用户")
+            return
+        
+        # 使用新的目录获取方法
+        cover_save_dir = self.get_cover_save_directory()
+        cover_save_mode = self.get_setting('cover_save_mode', 'smart')
+
+        if hasattr(self, 'parent') and self.parent():
+            self.parent().batch_save_missing_covers()
+
+
     def load_settings(self):
         if not self.user_manager.current_db_path:
             return
@@ -1568,6 +1666,42 @@ class SettingsDialog(QDialog):
             index = self.scan_mode.findData(mode)
             if index >= 0:
                 self.scan_mode.setCurrentIndex(index)
+
+        # === 新增：加载封面保存模式 ===
+        cursor.execute("SELECT value FROM settings WHERE key = 'cover_save_mode'")
+        result = cursor.fetchone()
+        if result:
+            mode = result[0]
+            index = self.cover_save_mode.findData(mode)
+            if index >= 0:
+                self.cover_save_mode.setCurrentIndex(index)
+        else:
+            # 默认使用智能模式
+            self.cover_save_mode.setCurrentIndex(0)
+        
+        # === 新增：加载封面保存目录 ===
+        cursor.execute("SELECT value FROM settings WHERE key = 'cover_save_dir'")
+        result = cursor.fetchone()
+        if result:
+            self.cover_save_dir.setText(result[0])
+
+        # === 新增：加载扫描时保存封面设置 ===
+        cursor.execute("SELECT value FROM settings WHERE key = 'scan_save_cover'")
+        result = cursor.fetchone()
+        if result:
+            self.scan_save_cover.setChecked(result[0] == "1")
+        else:
+            # 默认关闭
+            self.scan_save_cover.setChecked(False)
+
+        # === 新增：加载封面备份存在则跳过设置 ===
+        cursor.execute("SELECT value FROM settings WHERE key = 'skip_existing_covers'")
+        result = cursor.fetchone()
+        if result:
+            self.skip_existing_covers.setChecked(result[0] == "1")
+        else:
+            # 默认开启
+            self.skip_existing_covers.setChecked(True)
 
         conn.close()
     
@@ -1615,7 +1749,35 @@ class SettingsDialog(QDialog):
             )
 
 
+            # === 新增：保存封面保存模式 ===
+            cover_save_mode = self.cover_save_mode.currentData()
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("cover_save_mode", cover_save_mode)
+            )
             
+            # === 新增：保存封面保存目录 ===
+            cover_save_dir = self.cover_save_dir.text().strip()
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("cover_save_dir", cover_save_dir)
+            )
+
+            # === 新增：保存扫描时保存封面设置 ===
+            scan_save_cover = "1" if self.scan_save_cover.isChecked() else "0"
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("scan_save_cover", scan_save_cover)
+            )
+
+            # === 新增：保存封面备份存在则跳过设置 ===
+            skip_existing_covers = "1" if self.skip_existing_covers.isChecked() else "0"
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("skip_existing_covers", skip_existing_covers)
+            )
+
+
             conn.commit()
 
             # 保存后验证设置
@@ -1643,13 +1805,15 @@ class SettingsDialog(QDialog):
             conn = sqlite3.connect(self.user_manager.current_db_path)
             cursor = conn.cursor()
             
-            # 验证的关键设置列表
+            # 验证的关键设置列表 - 新增封面保存设置
             critical_settings = [
                 'scan_interval', 
                 'auto_scan', 
                 'scan_mode',
                 'include_filter',
-                'exclude_filter'
+                'exclude_filter',
+                'cover_save_mode',  
+                'cover_save_dir'    
             ]
             
             for key in critical_settings:
@@ -1679,6 +1843,14 @@ class SettingsDialog(QDialog):
         return verification_results
 
 
+    def browse_cover_save_dir(self):
+        """浏览选择封面保存目录"""
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择封面保存目录", 
+            self.cover_save_dir.text() or os.path.expanduser("~")
+        )
+        if directory:
+            self.cover_save_dir.setText(directory)
 
 
 
@@ -1722,7 +1894,8 @@ class DirectoryScannerApp(QMainWindow):
     def init_ui(self):
         # self.setWindowTitle("目录扫描管理系统")
         self.setWindowTitle(f"{ProjectInfo.NAME} {ProjectInfo.VERSION} (Build: {ProjectInfo.BUILD_DATE})")
-        self.setMinimumSize(1200, 600)
+        self.setMinimumSize(800, 600)
+        self.resize(800, 600)
         
         # 设置图标
         icon_path = os.path.join(self.app_dir, "icon.ico")
@@ -1752,7 +1925,12 @@ class DirectoryScannerApp(QMainWindow):
         
         # 分隔线
         toolbar.addSeparator()
-        
+
+        # 批量保存封面按钮
+        batch_cover_action = QAction(QIcon.fromTheme("document-save-all"), "批量保存封面", self)
+        batch_cover_action.triggered.connect(self.batch_save_all_covers)
+        toolbar.addAction(batch_cover_action)
+
         # 设置按钮
         settings_action = QAction(QIcon.fromTheme("preferences-system"), "设置", self)
         settings_action.triggered.connect(self.show_settings)
@@ -1792,9 +1970,6 @@ class DirectoryScannerApp(QMainWindow):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索目录...按回车或点击搜索按钮")
 
-        # 移除原来的文本变化连接
-        # self.search_input.textChanged.connect(self.filter_directories)
-        
         self.search_button = QPushButton("搜索")
         self.search_button.clicked.connect(self.filter_directories)
         self.search_input.returnPressed.connect(self.filter_directories)
@@ -1803,7 +1978,19 @@ class DirectoryScannerApp(QMainWindow):
         search_layout.addWidget(self.search_button)
         
         main_layout.addLayout(search_layout)
+
+        # === 新增：进度条 ===
+        progress_layout = QHBoxLayout()
         
+        self.progress_label = QLabel("就绪")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)  # 初始时隐藏
+        
+        progress_layout.addWidget(self.progress_label)
+        progress_layout.addWidget(self.progress_bar)
+        
+        main_layout.addLayout(progress_layout)
+
          # 添加一个空的滚动区域容器
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -1867,12 +2054,21 @@ class DirectoryScannerApp(QMainWindow):
         if result:
             scan_mode = result[0]
         
-        self.statusBar().showMessage(f"正在扫描目录: {path} (深度: {depth}, 模式: {scan_mode})...")
+        # === 新增：显示进度条 ===
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText(f"正在扫描目录: {path}...")
         QApplication.processEvents()
         
         try:
             # 传入扫描模式参数
             dirs = self.scan_directory_with_depth(path, depth, scan_mode)
+        
+            # === 新增：更新进度条 ===
+            self.progress_bar.setValue(50)
+            self.progress_label.setText("正在保存到数据库...")
+            QApplication.processEvents()
+        
             # 保存到数据库
             if self.user_manager.current_db_path:
                 conn = sqlite3.connect(self.user_manager.current_db_path)
@@ -1929,26 +2125,78 @@ class DirectoryScannerApp(QMainWindow):
                 
                 conn.commit()
                 
-                # 显示扫描统计信息
-                stats_msg = f"扫描完成: {valid_dirs_count} 个有效目录"
-                if invalid_dirs_count > 0:
-                    stats_msg += f", {invalid_dirs_count} 个无效目录被跳过"
-                self.statusBar().showMessage(stats_msg)
+                # === 新增：更新进度条 ===
+                self.progress_bar.setValue(75)
+                self.progress_label.setText("正在创建备份...")
+                QApplication.processEvents()
                 
                 # 创建备份
                 self.backup_manager.create_backup(self.user_manager.current_db_path)
 
                 # 保存主目录设置
                 self.save_main_directory_settings()
+            
+                # === 新增：更新进度条 ===
+                self.progress_bar.setValue(90)
+                self.progress_label.setText("正在保存封面图片...")
+                QApplication.processEvents()
+
+                # === 改进：每次扫描都保存/更新封面图片 ===
+                # 检查是否开启了"扫描时保存封面"选项
+                scan_save_cover = self.get_setting('scan_save_cover', '0') == '1'
+                cover_save_mode, cover_save_dir = self.get_cover_save_settings()
                 
+                if scan_save_cover and cover_save_dir:  # 只有在开启了选项且设置了保存目录时才保存封面
+                    saved_count = 0
+                    total_dirs = len([d for d in dirs if d.get("is_directory", 1) == 1])
+
+                    for i, dir_info in enumerate(dirs):                    
+                        if dir_info.get("is_directory", 1) == 1:  # 只处理目录
+                            dir_path = dir_info["path"]
+                            if os.path.exists(dir_path):
+                                cover_path = self.find_cover_image(dir_path)
+                                if cover_path:
+                                    if self.save_cover_image(dir_path, cover_path):
+                                        saved_count += 1
+
+                            # === 新增：更新封面保存进度 ===
+                            if total_dirs > 0:
+                                progress_value = 90 + int((i + 1) / total_dirs * 10)
+                                self.progress_bar.setValue(progress_value)
+                                self.progress_label.setText(f"正在保存封面图片... ({i+1}/{total_dirs})")
+                                QApplication.processEvents()
+                
+                    if saved_count > 0:
+                        self.statusBar().showMessage(f"扫描完成，保存了 {saved_count} 个封面")
+            
+                # === 新增：完成进度 ===
+                self.progress_bar.setValue(100)
+                self.progress_label.setText("扫描完成")
+                
+                # 显示扫描统计信息
+                stats_msg = f"扫描完成: {valid_dirs_count} 个有效目录"
+                if invalid_dirs_count > 0:
+                    stats_msg += f", {invalid_dirs_count} 个无效目录被跳过"
+                self.statusBar().showMessage(stats_msg)
+
         except Exception as e:
+            # === 新增：扫描失败时更新进度条 ===
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("扫描失败")
             self.statusBar().showMessage("扫描失败")
             QMessageBox.critical(self, "扫描错误", f"扫描目录时出错:\n{e}")
             print(f"[ERROR] 扫描错误: {e}")
         finally:
             if 'conn' in locals():
                 conn.close()
+        
+            # === 新增：扫描完成后隐藏进度条 ===
+            QTimer.singleShot(2000, self.hide_progress_bar)  # 2秒后隐藏
 
+    def hide_progress_bar(self):
+        """隐藏进度条"""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("就绪")
 
 
     def delete_main_directory(self, dir_id):
@@ -2334,15 +2582,36 @@ class DirectoryScannerApp(QMainWindow):
             QMessageBox.warning(self, "无主目录", "请先添加主目录")
             return
         
+        # === 新增：多目录扫描进度显示 ===
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText(f"准备扫描 {len(main_dirs)} 个主目录...")
+        QApplication.processEvents()
+        
         # 扫描每个主目录
-        for dir_info in main_dirs:
+        for i, dir_info in enumerate(main_dirs):
             dir_id, path, depth = dir_info  # 获取已保存的扫描深度
+            
+            # 更新进度
+            progress_value = int((i) / len(main_dirs) * 100)
+            self.progress_bar.setValue(progress_value)
+            self.progress_label.setText(f"正在扫描: {os.path.basename(path)}... ({i+1}/{len(main_dirs)})")
+            QApplication.processEvents()
+            
             # 调用扫描单个主目录的方法
             self.scan_single_main_directory(path, depth)
         
         # 加载最新的目录列表
         self.load_directories()
+        
+        # === 新增：完成多目录扫描 ===
+        self.progress_bar.setValue(100)
+        self.progress_label.setText("所有主目录扫描完成")
         self.statusBar().showMessage("所有主目录扫描完成")
+        
+        # 2秒后隐藏进度条
+        QTimer.singleShot(2000, self.hide_progress_bar)
+
     
 
 
@@ -2838,7 +3107,19 @@ class DirectoryScannerApp(QMainWindow):
         exclude_filter = self.get_setting('exclude_filter', '')
         if exclude_filter:
             issues.append(f"✅ 排除过滤: {exclude_filter}")
+
+        # === 新增：验证封面保存设置 ===
+        cover_save_mode, cover_save_dir = self.get_cover_save_settings()
+        issues.append(f"✅ 封面保存模式: {cover_save_mode}")
         
+        if cover_save_dir:
+            if os.path.exists(cover_save_dir):
+                issues.append(f"✅ 封面保存目录: {cover_save_dir}")
+            else:
+                issues.append(f"⚠️ 封面保存目录不存在: {cover_save_dir}")
+        else:
+            issues.append("ℹ️ 封面保存目录: 未设置")
+
         return issues
 
 
@@ -3096,9 +3377,14 @@ class DirectoryScannerApp(QMainWindow):
 
     
     def find_cover_image(self, directory):
-        """查找目录中的封面图片：优先使用cover.*，没有则使用第一张图片"""
+        """查找目录中的封面图片：优先使用保存的封面，然后使用目录中的图片"""
         if not os.path.isdir(directory):
             return None
+
+        # === 新增：首先检查是否有保存的封面 ===
+        saved_cover_path = self.get_saved_cover_path(directory)
+        if saved_cover_path and os.path.exists(saved_cover_path):
+            return saved_cover_path
             
         # 1. 首先查找 cover.* 文件
         cover_patterns = ['cover.*', '封面.*', 'Cover.*', 'COVER.*']
@@ -3382,6 +3668,468 @@ class DirectoryScannerApp(QMainWindow):
         else:
             # 调用原有的鼠标事件处理
             QLabel.mousePressEvent(self.sender(), event)
+
+    def get_cover_save_settings(self):
+        """获取封面保存设置"""
+        cover_save_mode = self.get_setting('cover_save_mode', 'smart')
+        cover_save_dir = self.get_setting('cover_save_dir', '')
+        return cover_save_mode, cover_save_dir
+
+    def save_cover_image(self, directory_path, cover_image_path):
+        """增强的封面图片保存方法"""
+        if not cover_image_path or not os.path.exists(cover_image_path):
+            print(f"[DEBUG] 封面图片不存在: {cover_image_path}")
+            return False
+
+        # 检查并确保保存目录
+        success, cover_save_dir = self.ensure_cover_save_directory()
+        if not success:
+            print(f"[DEBUG] 封面保存目录准备失败: {cover_save_dir}")
+            return False
+        
+        cover_save_mode = self.get_setting('cover_save_mode', 'smart')
+    
+        # === 新增：检查是否开启"封面备份存在则跳过" ===
+        skip_existing = self.get_setting('skip_existing_covers', '1') == '1'
+    
+        # 获取目录名称
+        dir_name = os.path.basename(directory_path)
+        
+        try:
+            # 根据模式确定保存路径
+            if cover_save_mode == 'smart':
+                # 智能模式：检查是否符合AV格式
+                if self.is_av_format(dir_name):
+                    save_path = self.get_series_save_path(dir_name, cover_save_dir, cover_image_path)
+                else:
+                    save_path = self.get_first_char_save_path(dir_name, cover_save_dir, cover_image_path)
+            
+            elif cover_save_mode == 'series':
+                save_path = self.get_series_save_path(dir_name, cover_save_dir, cover_image_path)
+            
+            elif cover_save_mode == 'first_char':
+                save_path = self.get_first_char_save_path(dir_name, cover_save_dir, cover_image_path)
+            
+            else:
+                # 默认使用智能模式
+                if self.is_av_format(dir_name):
+                    save_path = self.get_series_save_path(dir_name, cover_save_dir, cover_image_path)
+                else:
+                    save_path = self.get_first_char_save_path(dir_name, cover_save_dir, cover_image_path)
+            
+            if not save_path:
+                print(f"[DEBUG] 无法生成保存路径: {dir_name}")
+                return False
+        
+            # === 新增：检查封面是否已存在，如果存在且开启跳过选项，则直接返回 ===
+            if skip_existing and os.path.exists(save_path):
+                print(f"[DEBUG] 封面已存在，跳过保存: {save_path}")
+                return True  # 返回True表示"跳过"是预期行为
+        
+            # 确保目标目录存在
+            target_dir = os.path.dirname(save_path)
+            os.makedirs(target_dir, exist_ok=True)
+            
+            # 复制封面图片
+            if not os.path.exists(save_path):
+                shutil.copy2(cover_image_path, save_path)
+                print(f"[DEBUG] 封面保存成功: {save_path}")
+                return True
+            else:
+                print(f"[DEBUG] 封面已存在: {save_path}")
+                return True  # 已存在也算成功
+                
+        except Exception as e:
+            print(f"[ERROR] 保存封面图片失败: {e}")
+            print(f"[DEBUG] 目录: {directory_path}")
+            print(f"[DEBUG] 封面源: {cover_image_path}")
+            print(f"[DEBUG] 目标路径: {save_path if 'save_path' in locals() else 'N/A'}")
+        
+        return False
+
+
+    def is_av_format(self, dir_name):
+        """检查目录名称是否符合AV格式 (XXXX-####)"""
+        # AV格式正则：字母和数字组成的模式，通常为XXXX-####格式
+        av_pattern = r'^[a-zA-Z]{2,6}-\d{2,6}$'
+        return re.match(av_pattern, dir_name) is not None
+
+    def get_series_save_path(self, dir_name, base_dir, cover_image_path):
+        """获取系列模式下的保存路径"""
+        # 提取系列名称（XXXX部分）
+        series_match = re.match(r'^([a-zA-Z]{2,6})-\d{2,6}$', dir_name)
+        if not series_match:
+            return None
+        
+        series_name = series_match.group(1)
+        series_dir = os.path.join(base_dir, series_name)
+        
+        # 确保系列目录存在
+        os.makedirs(series_dir, exist_ok=True)
+        
+        # 获取文件扩展名
+        ext = os.path.splitext(cover_image_path)[1]
+        
+        # 构建保存路径
+        save_filename = f"{dir_name}{ext}"
+        return os.path.join(series_dir, save_filename)
+
+    def get_first_char_save_path(self, dir_name, base_dir, cover_image_path):
+        """获取首字模式下的保存路径"""
+        # 获取首字母（中文取拼音首字母，英文取首字母）
+        first_char = self.get_first_character(dir_name)
+        
+        # 构建首字母目录
+        first_char_dir = os.path.join(base_dir, first_char.upper())
+        
+        # 确保首字母目录存在
+        os.makedirs(first_char_dir, exist_ok=True)
+        
+        # 获取文件扩展名
+        ext = os.path.splitext(cover_image_path)[1]
+        
+        # 构建保存路径
+        save_filename = f"{dir_name}{ext}"
+        return os.path.join(first_char_dir, save_filename)
+
+    def get_first_character(self, text):
+        """获取文本的首字母"""
+        if not text:
+            return "OTHER"
+        
+        first_char = text[0]
+        
+        # 如果是中文字符，获取拼音首字母
+        if '\u4e00' <= first_char <= '\u9fff':
+            return PinyinSearchHelper.get_pinyin_initials(first_char).upper()
+        else:
+            # 英文字符，直接取首字母
+            return first_char.upper() if first_char.isalpha() else "OTHER"
+
+    def batch_save_all_covers(self):
+        """为所有已扫描目录批量保存封面图片 - 增强版本"""
+        if not self.user_manager.current_db_path:
+            QMessageBox.warning(self, "未登录", "请先登录用户")
+            return
+
+        # 检查保存目录
+        success, cover_save_dir = self.ensure_cover_save_directory()
+        if not success:
+            QMessageBox.critical(self, "目录错误", f"封面保存目录准备失败:\n{cover_save_dir}")
+            return
+
+        cover_save_mode = self.get_setting('cover_save_mode', 'smart')
+
+        # 确认操作
+        reply = QMessageBox.question(
+            self, "确认批量保存",
+            f"确定要为所有已扫描目录保存封面图片吗？\n"
+            f"保存目录: {cover_save_dir}\n"
+            f"保存模式: {cover_save_mode}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        try:
+            conn = sqlite3.connect(self.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            # 获取所有目录
+            cursor.execute("SELECT path FROM directories WHERE is_directory = 1")
+            directories = cursor.fetchall()
+            
+            total_count = len(directories)
+            saved_count = 0
+            failed_count = 0
+            error_details = []
+
+            # 创建进度对话框
+            progress_dialog = QProgressDialog("正在批量保存封面...", "取消", 0, total_count, self)
+            progress_dialog.setWindowTitle("批量保存封面")
+            progress_dialog.setWindowModality(Qt.WindowModal)
+            progress_dialog.show()
+
+            for i, (dir_path,) in enumerate(directories):
+                if progress_dialog.wasCanceled():
+                    break
+                    
+                progress_dialog.setValue(i)
+                progress_dialog.setLabelText(f"正在处理: {os.path.basename(dir_path)}... ({i+1}/{total_count})")
+                QApplication.processEvents()
+                
+                if os.path.exists(dir_path):
+                    cover_path = self.find_cover_image(dir_path)
+                    if cover_path and os.path.exists(cover_path):
+                        if self.save_cover_image(dir_path, cover_path):
+                            saved_count += 1
+                        else:
+                            failed_count += 1
+                            error_details.append(f"保存失败: {dir_path}")
+                    else:
+                        failed_count += 1
+                        error_details.append(f"无封面图片: {dir_path}")
+                else:
+                    failed_count += 1
+                    error_details.append(f"目录不存在: {dir_path}")
+            
+            progress_dialog.close()
+
+            # 显示详细结果
+            result_msg = f"批量保存完成！\n成功: {saved_count} 个\n失败: {failed_count} 个"
+            
+            if failed_count > 0:
+                result_msg += f"\n\n失败详情（前10个）:"
+                for i, detail in enumerate(error_details[:10]):
+                    result_msg += f"\n{i+1}. {detail}"
+                if len(error_details) > 10:
+                    result_msg += f"\n... 还有 {len(error_details) - 10} 个失败项"
+            
+            # 保存详细日志到文件
+            if error_details:
+                log_file = os.path.join(cover_save_dir, "cover_save_errors.log")
+                try:
+                    with open(log_file, 'w', encoding='utf-8') as f:
+                        f.write(f"封面保存错误日志 - {datetime.datetime.now()}\n")
+                        f.write(f"成功: {saved_count}, 失败: {failed_count}\n\n")
+                        for detail in error_details:
+                            f.write(f"{detail}\n")
+                    result_msg += f"\n\n详细错误日志已保存到: {log_file}"
+                except Exception as e:
+                    print(f"[ERROR] 保存错误日志失败: {e}")
+            
+            QMessageBox.information(self, "批量保存完成", result_msg)
+            self.statusBar().showMessage(f"批量保存完成 - 成功 {saved_count} 个目录")
+            
+        except Exception as e:
+            print(f"[ERROR] 批量保存封面时出错: {e}")
+            QMessageBox.critical(self, "批量保存失败", f"批量保存封面时出错:\n{e}")
+            self.statusBar().showMessage("批量保存失败")
+        finally:
+            if conn:
+                conn.close()
+
+
+    def batch_save_missing_covers(self):
+        """只为缺少封面的目录保存封面"""
+        if not self.user_manager.current_db_path:
+            QMessageBox.warning(self, "未登录", "请先登录用户")
+            return
+        
+        cover_save_mode, cover_save_dir = self.get_cover_save_settings()
+        if not cover_save_dir:
+            QMessageBox.warning(self, "未设置保存目录", "请先在设置中设置封面保存目录")
+            return
+        
+        try:
+            conn = sqlite3.connect(self.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            # 获取所有目录
+            cursor.execute("SELECT path FROM directories WHERE is_directory = 1")
+            directories = cursor.fetchall()
+            
+            missing_count = 0
+            saved_count = 0
+            
+            self.statusBar().showMessage("正在检查缺少封面的目录...")
+            QApplication.processEvents()
+            
+            # 首先统计缺少封面的目录
+            for dir_path, in directories:
+                if os.path.exists(dir_path):
+                    expected_cover_path = self.get_expected_cover_path(dir_path, cover_save_dir, cover_save_mode)
+                    if not expected_cover_path or not os.path.exists(expected_cover_path):
+                        missing_count += 1
+            
+            if missing_count == 0:
+                QMessageBox.information(self, "无需保存", "所有目录的封面图片都已保存")
+                return
+            
+            # 确认操作
+            reply = QMessageBox.question(
+                self, "确认保存缺失封面",
+                f"检测到 {missing_count} 个目录缺少封面图片，确定要保存吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                return
+            
+            # 保存缺失的封面
+            current_count = 0
+            for i, (dir_path,) in enumerate(directories):
+                if os.path.exists(dir_path):
+                    expected_cover_path = self.get_expected_cover_path(dir_path, cover_save_dir, cover_save_mode)
+                    if not expected_cover_path or not os.path.exists(expected_cover_path):
+                        current_count += 1
+                        self.statusBar().showMessage(f"正在保存缺失封面... ({current_count}/{missing_count})")
+                        QApplication.processEvents()
+                        
+                        cover_path = self.find_cover_image(dir_path)
+                        if cover_path and os.path.exists(cover_path):
+                            if self.save_cover_image(dir_path, cover_path):
+                                saved_count += 1
+            
+            QMessageBox.information(self, "保存完成", f"成功保存 {saved_count} 个缺失封面")
+            self.statusBar().showMessage(f"缺失封面保存完成 - 成功 {saved_count} 个")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"保存缺失封面时出错:\n{e}")
+            self.statusBar().showMessage("保存缺失封面失败")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_expected_cover_path(self, directory_path, base_dir, cover_save_mode):
+        """获取预期的封面保存路径"""
+        dir_name = os.path.basename(directory_path)
+        
+        try:
+            if cover_save_mode == 'smart':
+                if self.is_av_format(dir_name):
+                    return self.get_series_save_path(dir_name, base_dir, ".jpg")  # 假设扩展名
+                else:
+                    return self.get_first_char_save_path(dir_name, base_dir, ".jpg")
+            elif cover_save_mode == 'series':
+                return self.get_series_save_path(dir_name, base_dir, ".jpg")
+            elif cover_save_mode == 'first_char':
+                return self.get_first_char_save_path(dir_name, base_dir, ".jpg")
+        except:
+            pass
+        
+        return None
+
+    def check_cover_save_status(self):
+        """检查封面保存状态"""
+        if not self.user_manager.current_db_path:
+            return
+
+        # 使用新的目录获取方法
+        cover_save_dir = self.get_cover_save_directory()
+        cover_save_mode = self.get_setting('cover_save_mode', 'smart')
+        
+
+        cover_save_mode, cover_save_dir = self.get_cover_save_settings()
+        if not cover_save_dir:
+            QMessageBox.information(self, "未设置", "请先设置封面保存目录")
+            return
+        
+        try:
+            conn = sqlite3.connect(self.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM directories WHERE is_directory = 1")
+            total_dirs = cursor.fetchone()[0]
+            
+            saved_count = 0
+            for dir_path, in cursor.execute("SELECT path FROM directories WHERE is_directory = 1"):
+                if os.path.exists(dir_path):
+                    expected_path = self.get_expected_cover_path(dir_path, cover_save_dir, cover_save_mode)
+                    if expected_path and os.path.exists(expected_path):
+                        saved_count += 1
+            
+            status_msg = f"封面保存状态:\n总目录数: {total_dirs}\n已保存封面: {saved_count}\n缺失封面: {total_dirs - saved_count}"
+            
+            if total_dirs - saved_count > 0:
+                status_msg += f"\n\n点击'只保存缺失封面'按钮可补全缺失封面"
+            
+            QMessageBox.information(self, "封面保存状态", status_msg)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "检查失败", f"检查封面保存状态时出错:\n{e}")
+        finally:
+            if conn:
+                conn.close()
+
+
+
+    def ensure_cover_save_directory(self):
+        """确保封面保存目录存在且有写入权限"""
+        cover_save_dir = self.get_cover_save_directory()
+        
+        if not cover_save_dir:
+            return False, "封面保存目录未设置"
+        
+        try:
+            # 创建目录（如果不存在）
+            os.makedirs(cover_save_dir, exist_ok=True)
+            
+            # 测试写入权限
+            test_file = os.path.join(cover_save_dir, "write_test.tmp")
+            with open(test_file, 'w') as f:
+                f.write("test")
+            os.remove(test_file)
+            
+            return True, cover_save_dir
+        except Exception as e:
+            return False, f"目录创建或权限测试失败: {e}"
+
+    def get_cover_save_directory(self):
+        """增强的封面保存目录获取方法"""
+        cover_save_dir = self.get_setting('cover_save_dir', '')
+        
+        # 如果用户未设置，使用默认目录
+        if not cover_save_dir:
+            # 使用用户主目录下的"目录封面"文件夹，避免权限问题
+            default_dir = os.path.join(os.path.expanduser("~"), "目录封面")
+            return default_dir
+        
+        return cover_save_dir
+
+    def debug_cover_save_status(self):
+        """调试封面保存状态"""
+        cover_save_dir = self.get_cover_save_directory()
+        print(f"[DEBUG] 封面保存目录: {cover_save_dir}")
+        print(f"[DEBUG] 目录存在: {os.path.exists(cover_save_dir)}")
+        print(f"[DEBUG] 目录可写: {os.access(cover_save_dir, os.W_OK) if os.path.exists(cover_save_dir) else 'N/A'}")
+        
+        # 测试保存一个目录
+        if hasattr(self, 'table_widget') and self.table_widget.rowCount() > 0:
+            test_dir_path = self.table_widget.item(0, 4).text()
+            test_cover_path = self.find_cover_image(test_dir_path)
+            print(f"[DEBUG] 测试目录: {test_dir_path}")
+            print(f"[DEBUG] 测试封面: {test_cover_path}")
+            print(f"[DEBUG] 封面存在: {os.path.exists(test_cover_path) if test_cover_path else 'N/A'}")
+
+    def get_saved_cover_path(self, directory_path):
+        """获取已保存的封面图片路径"""
+        cover_save_mode, cover_save_dir = self.get_cover_save_settings()
+        if not cover_save_dir:
+            return None
+        
+        dir_name = os.path.basename(directory_path)
+        
+        try:
+            # 根据保存模式构建预期的保存路径
+            if cover_save_mode == 'smart':
+                if self.is_av_format(dir_name):
+                    save_path = self.get_series_save_path(dir_name, cover_save_dir, ".jpg")
+                else:
+                    save_path = self.get_first_char_save_path(dir_name, cover_save_dir, ".jpg")
+            elif cover_save_mode == 'series':
+                save_path = self.get_series_save_path(dir_name, cover_save_dir, ".jpg")
+            elif cover_save_mode == 'first_char':
+                save_path = self.get_first_char_save_path(dir_name, cover_save_dir, ".jpg")
+            else:
+                # 默认使用智能模式
+                if self.is_av_format(dir_name):
+                    save_path = self.get_series_save_path(dir_name, cover_save_dir, ".jpg")
+                else:
+                    save_path = self.get_first_char_save_path(dir_name, cover_save_dir, ".jpg")
+            
+            # 检查文件是否存在（尝试常见图片扩展名）
+            for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
+                test_path = save_path.rsplit('.', 1)[0] + ext
+                if os.path.exists(test_path):
+                    return test_path
+            
+            return None
+            
+        except Exception as e:
+            print(f"[DEBUG] 获取保存封面路径失败: {e}")
+            return None
 
 
 # 主程序
