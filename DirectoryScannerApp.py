@@ -32,7 +32,7 @@ if pinyin_available:
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "2.28.0"
+    VERSION = "2.33.0"
     BUILD_DATE = "2025-11-03"
     # from datetime import datetime
     # BUILD_DATE = datetime.now().strftime("%Y-%m-%d")  # 修改为动态获取当前日期
@@ -46,6 +46,7 @@ class ProjectInfo:
 
     # 补充完整的版本历史
     VERSION_HISTORY = {
+        "2.33.0": "增强图片点击查看功能",
         "2.27.0": "增强拼音搜索功能，优化数据库性能，修复扫描模式设置问题",
         "2.8.0": "添加多用户支持，改进UI界面，增加主目录管理功能",
         "1.4.0": "添加自动备份和恢复功能，支持数据库回滚",
@@ -58,7 +59,7 @@ class ProjectInfo:
     HELP_TEXT = """
 使用说明:
 
-版本: 2.27.0
+版本: 2.33.0
 作者: 杜玛
 
 主要功能:
@@ -946,8 +947,10 @@ class UserManager:
             self.current_user = username
             self.current_db_path = os.path.join(self.app_dir, f"user_{username}.db")
             
+            print(f"[INFO] 用户 {username} 登录成功")
             return True, None
         except Exception as e:
+            print(f"[ERROR] 用户登录失败: {e}")
             return False, str(e)
         finally:
             conn.close()
@@ -1321,11 +1324,21 @@ class UserManagerDialog(QDialog):
         self.login_user(username)
     
     def login_user(self, username):
+        # 显示登录中状态
+        if hasattr(self, 'parent') and self.parent():
+            self.parent().statusBar().showMessage(f"正在登录用户 {username}...")
+            QApplication.processEvents()
+        
         success, error = self.user_manager.login_user(username)
         if success:
+            if hasattr(self, 'parent') and self.parent():
+                self.parent().statusBar().showMessage(f"用户 {username} 登录成功")
             self.accept()
         else:
+            if hasattr(self, 'parent') and self.parent():
+                self.parent().statusBar().showMessage("登录失败")
             QMessageBox.critical(self, "登录失败", f"登录用户 {username} 时出错:\n{error}")
+
     
     def add_user(self):
         username = self.new_username.text().strip()
@@ -1810,7 +1823,12 @@ class DirectoryScannerApp(QMainWindow):
             # 用户已登录，加载用户数据
             self.load_user_settings()
             self.load_directories()
-            
+
+            # 延迟启动自动扫描，避免登录后立即扫描造成卡顿
+            QTimer.singleShot(3000, self.start_auto_scan)  # 延迟3秒启动
+            print(f"[DEBUG] 用户 {self.user_manager.current_user} 已登录，加载用户数据完成")    
+            self.statusBar().showMessage("登录成功，界面已就绪")
+
             # 启动自动扫描定时器
             self.start_auto_scan()
     
@@ -2436,12 +2454,15 @@ class DirectoryScannerApp(QMainWindow):
                 cover_widget.setFixedSize(180, 120)
                 cover_widget.setAlignment(Qt.AlignCenter)
                 cover_widget.setStyleSheet("background-color: #f8f9fa; border: 1px solid #dee2e6;")
+                cover_widget.setCursor(Qt.PointingHandCursor)  # 添加手型光标
 
                 if is_directory == 1:  # 如果是目录
                     # 查找封面图片（目录中的第一张图片）
                     cover_path = self.find_cover_image(path)
                     if cover_path and os.path.exists(cover_path):
                         self.set_preview_image(cover_widget, cover_path)
+                        # 为封面图片设置点击事件
+                        cover_widget.mousePressEvent = lambda event, img_path=cover_path: self.on_image_clicked(event, img_path)
                     else:
                         # 没有图片则显示文件夹图标和提示文字
                         cover_widget.setText("📁\n无图片")
@@ -2457,6 +2478,8 @@ class DirectoryScannerApp(QMainWindow):
                     # 如果是文件，直接显示文件预览
                     if path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')) and os.path.exists(path):
                         self.set_preview_image(cover_widget, path)
+                        # 为文件图片设置点击事件
+                        cover_widget.mousePressEvent = lambda event, img_path=path: self.on_image_clicked(event, img_path)
                     else:
                         cover_widget.setText("📄\n非图片文件")
                         cover_widget.setStyleSheet("""
@@ -2507,7 +2530,10 @@ class DirectoryScannerApp(QMainWindow):
             
             # 显示状态信息
             self.statusBar().showMessage(f"加载了 {len(valid_directories)} 个有效目录")
-            
+
+            # 设置图片点击事件
+            self.setup_image_click_events()
+
         except Exception as e:
             print(f"[DEBUG] 加载目录出错: {e}")
             QMessageBox.critical(self, "加载目录出错", f"加载目录时发生错误:\n{e}")
@@ -2546,16 +2572,18 @@ class DirectoryScannerApp(QMainWindow):
                     continue  # 跳过封面图片
                 other_images.append(img)
             
-            # 最多显示3个缩略图
-            max_thumbnails = min(3, len(other_images))
+            max_thumbnails = len(other_images)
             
             for i in range(max_thumbnails):
                 thumb_label = QLabel()
                 thumb_label.setFixedSize(180, 120)  # 跟封面一样的尺寸
                 thumb_label.setAlignment(Qt.AlignCenter)
+                thumb_label.setCursor(Qt.PointingHandCursor)  # 添加手型光标，提示可点击
             
                 if i < len(other_images):
                     self.set_preview_image(thumb_label, other_images[i])
+                    # 为缩略图设置点击事件
+                    thumb_label.mousePressEvent = lambda event, img_path=other_images[i]: self.on_image_clicked(event, img_path)
                 else:
                     thumb_label.setText("")
                 
@@ -2997,22 +3025,75 @@ class DirectoryScannerApp(QMainWindow):
                 preview_widget.setText("📄")  # 不是图片则显示文件图标
                 
         return preview_widget
-    
-    def set_preview_image(self, label, image_path):
-        """设置预览图片"""
+
+    def safe_load_and_scale_image(self, image_path, target_width=180, target_height=120):
+        """安全加载和缩放图片，确保参数类型正确"""
         try:
+            # 参数验证
+            if not image_path or not os.path.exists(image_path):
+                return None
+                
             pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
-                # 缩放图片以适应预览区域，保持宽高比
-                scaled_pixmap = pixmap.scaled(
-                    label.width(), label.height(), 
-                    Qt.KeepAspectRatio, 
-                    Qt.SmoothTransformation
-                )
-                label.setPixmap(scaled_pixmap)
+            if pixmap.isNull():
+                return None
+                
+            # 确保目标尺寸是整数
+            target_width = int(target_width)
+            target_height = int(target_height)
+            
+            # 确保是正整数
+            target_width = max(1, target_width)
+            target_height = max(1, target_height)
+            
+            # 使用 QSize 对象来避免类型问题
+            target_size = QSize(target_width, target_height)
+            
+            # 缩放图片，保持宽高比
+            scaled_pixmap = pixmap.scaled(
+                target_size, 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
+            )
+            
+            return scaled_pixmap
+            
         except Exception as e:
-            print(f"加载预览图片出错: {e}")
+            print(f"[ERROR] 安全加载图片失败: {e}")
+            return None
+
+    def set_preview_image(self, label, image_path):
+        """设置预览图片 - 使用安全方法"""
+        try:
+            scaled_pixmap = self.safe_load_and_scale_image(image_path)
+            if scaled_pixmap and not scaled_pixmap.isNull():
+                label.setPixmap(scaled_pixmap)
+            else:
+                label.setText("❌")
+        except Exception as e:
+            print(f"设置预览图片出错: {e}")
             label.setText("❌")
+
+    def on_thumbnail_clicked(self, event, image_path, row, index):
+        """处理缩略图点击事件 - 专门用于调试和确保正确性"""
+        print(f"[DEBUG] 点击缩略图: 行{row}, 索引{index}, 图片路径: {image_path}")
+        
+        if event.button() == Qt.LeftButton:  # 左键点击
+            # 验证图片文件是否存在
+            if os.path.exists(image_path):
+                self.show_full_image(image_path)
+            else:
+                QMessageBox.warning(self, "图片不存在", f"无法找到图片文件:\n{image_path}")
+        else:
+            # 调用原有的鼠标事件处理
+            if hasattr(self.sender(), 'mousePressEvent'):
+                QLabel.mousePressEvent(self.sender(), event)
+
+
+
+
+
+
+
     
     def find_cover_image(self, directory):
         """查找目录中的封面图片：优先使用cover.*，没有则使用第一张图片"""
@@ -3178,6 +3259,129 @@ class DirectoryScannerApp(QMainWindow):
         dialog.setLayout(layout)
         dialog.exec_()
 
+    def show_full_image(self, image_path):
+        """显示完整图片的对话框"""
+        if not image_path or not os.path.exists(image_path):
+            QMessageBox.warning(self, "图片不存在", "无法找到指定的图片文件")
+            return
+        
+        try:
+            # 创建图片显示对话框
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"图片预览 - {os.path.basename(image_path)}")
+            dialog.setMinimumSize(800, 600)
+            
+            layout = QVBoxLayout()
+            
+            # 图片显示区域
+            image_label = QLabel()
+            image_label.setAlignment(Qt.AlignCenter)
+            image_label.setStyleSheet("background-color: #f0f0f0;")
+            
+            # 使用安全方法加载图片
+            screen_geometry = QApplication.desktop().availableGeometry()
+            max_width = int(screen_geometry.width() * 0.8)
+            max_height = int(screen_geometry.height() * 0.8)
+            
+            scaled_pixmap = self.safe_load_and_scale_image(image_path, max_width, max_height)
+            if scaled_pixmap and not scaled_pixmap.isNull():
+                image_label.setPixmap(scaled_pixmap)
+                # 设置对话框大小
+                dialog.resize(scaled_pixmap.width() + 20, scaled_pixmap.height() + 60)
+            else:
+                image_label.setText("无法加载图片")
+            
+            # 图片信息
+            info_label = QLabel(f"图片路径: {image_path}")
+            info_label.setWordWrap(True)
+            info_label.setStyleSheet("padding: 5px; background-color: white;")
+            
+            # 按钮
+            button_layout = QHBoxLayout()
+            close_button = QPushButton("关闭")
+            close_button.clicked.connect(dialog.close)
+            
+            button_layout.addStretch()
+            button_layout.addWidget(close_button)
+            
+            # 添加到布局
+            layout.addWidget(image_label)
+            layout.addWidget(info_label)
+            layout.addLayout(button_layout)
+            
+            dialog.setLayout(layout)
+            dialog.exec_()
+            
+        except Exception as e:
+            print(f"[DEBUG] 加载图片时出错: {e}")
+            QMessageBox.critical(self, "错误", f"加载图片时出错:\n{e}")
+
+            
+
+    def setup_image_click_events(self):
+        """为所有图片设置点击事件"""
+        if not hasattr(self, 'table_widget'):
+            return
+        
+        for row in range(self.table_widget.rowCount()):
+            # 封面图片点击事件
+            cover_widget = self.table_widget.cellWidget(row, 0)
+            if cover_widget and isinstance(cover_widget, QLabel):
+                # 获取该行的路径信息
+                path_item = self.table_widget.item(row, 4)
+                if path_item:
+                    path = path_item.text()
+                    is_directory_item = self.table_widget.item(row, 1)  # 假设第二列有目录信息
+                    
+                    if is_directory_item:
+                        # 如果是目录，查找封面图片路径
+                        cover_path = self.find_cover_image(path)
+                        if cover_path:
+                            # 移除原有的事件过滤器（如果有）
+                            cover_widget.mousePressEvent = lambda event, img_path=cover_path: self.on_image_clicked(event, img_path)
+            
+            # 其他缩略图点击事件 - 修复索引计算问题
+            thumbnails_widget = self.table_widget.cellWidget(row, 2)
+            if thumbnails_widget:
+                # 查找所有缩略图标签
+                for i in range(thumbnails_widget.layout().count()):
+                    thumb_label = thumbnails_widget.layout().itemAt(i).widget()
+                    if thumb_label and isinstance(thumb_label, QLabel):
+                        # 获取该缩略图对应的图片路径
+                        path_item = self.table_widget.item(row, 4)
+                        if path_item:
+                            path = path_item.text()
+                            # 查找该目录中的所有图片
+                            all_images = self.find_all_images(path)
+                            
+                            # 获取封面图片路径
+                            cover_path = self.find_cover_image(path)
+                            
+                            # 过滤掉封面图片，获取其他图片列表
+                            other_images = []
+                            for img in all_images:
+                                if cover_path and os.path.abspath(img) == os.path.abspath(cover_path):
+                                    continue  # 跳过封面图片
+                                other_images.append(img)
+                            
+                            # 按文件名排序确保顺序一致
+                            other_images.sort()
+                            
+                            # 修复：确保索引正确对应
+                            if i < len(other_images):
+                                img_path = other_images[i]
+                                # 使用闭包确保每个缩略图都有正确的图片路径
+                                thumb_label.mousePressEvent = lambda event, img_path=img_path, row=row, idx=i: self.on_thumbnail_clicked(event, img_path, row, idx)
+
+
+
+    def on_image_clicked(self, event, image_path):
+        """处理图片点击事件"""
+        if event.button() == Qt.LeftButton:  # 左键点击
+            self.show_full_image(image_path)
+        else:
+            # 调用原有的鼠标事件处理
+            QLabel.mousePressEvent(self.sender(), event)
 
 
 # 主程序
