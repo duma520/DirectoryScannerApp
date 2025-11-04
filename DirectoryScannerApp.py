@@ -8,6 +8,7 @@ import datetime
 import time
 import re
 import glob
+import hashlib
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QMessageBox, QDialog, QComboBox, QSpinBox, 
@@ -30,9 +31,11 @@ else:
 if pinyin_available:
     pass    
 
+
+
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "2.42.0"
+    VERSION = "2.50.0"
     BUILD_DATE = "2025-11-03"
     # from datetime import datetime
     # BUILD_DATE = datetime.now().strftime("%Y-%m-%d")  # 修改为动态获取当前日期
@@ -46,6 +49,7 @@ class ProjectInfo:
 
     # 补充完整的版本历史
     VERSION_HISTORY = {
+        "2.50.0": "修复一些错位",
         "2.42.0": "增强保存封面，扫描进度条",
         "2.33.0": "增强图片点击查看功能",
         "2.27.0": "增强拼音搜索功能，优化数据库性能，修复扫描模式设置问题",
@@ -1616,10 +1620,14 @@ class SettingsDialog(QDialog):
         
         # 使用新的目录获取方法
         cover_save_dir = self.get_cover_save_directory()
-        cover_save_mode = self.get_setting('cover_save_mode', 'smart')
+        cover_save_mode = self.cover_save_mode.currentData()
 
-        if hasattr(self, 'parent') and self.parent():
+        # 防御性编程：确保父窗口存在且有相应方法
+        if hasattr(self, 'parent') and self.parent() and hasattr(self.parent(), 'batch_save_missing_covers'):
             self.parent().batch_save_missing_covers()
+        else:
+            QMessageBox.warning(self, "操作失败", "无法执行批量保存操作")
+
 
 
     def load_settings(self):
@@ -1852,6 +1860,17 @@ class SettingsDialog(QDialog):
         if directory:
             self.cover_save_dir.setText(directory)
 
+    def get_cover_save_directory(self):
+        """获取封面保存目录"""
+        cover_save_dir = self.cover_save_dir.text().strip()
+        
+        # 如果用户未设置，使用默认目录
+        if not cover_save_dir:
+            # 使用用户主目录下的"目录封面"文件夹，避免权限问题
+            default_dir = os.path.join(os.path.expanduser("~"), "目录封面")
+            return default_dir
+        
+        return cover_save_dir
 
 
 
@@ -2145,6 +2164,7 @@ class DirectoryScannerApp(QMainWindow):
                 # 检查是否开启了"扫描时保存封面"选项
                 scan_save_cover = self.get_setting('scan_save_cover', '0') == '1'
                 cover_save_mode, cover_save_dir = self.get_cover_save_settings()
+                skip_existing = self.get_setting('skip_existing_covers', '1') == '1'  # 新增：获取跳过设置
                 
                 if scan_save_cover and cover_save_dir:  # 只有在开启了选项且设置了保存目录时才保存封面
                     saved_count = 0
@@ -2156,6 +2176,14 @@ class DirectoryScannerApp(QMainWindow):
                             if os.path.exists(dir_path):
                                 cover_path = self.find_cover_image(dir_path)
                                 if cover_path:
+                                    # 新增：检查是否需要跳过
+                                    expected_save_path = self.get_expected_cover_path(dir_path, cover_save_dir, cover_save_mode)
+                                    if skip_existing and expected_save_path and os.path.exists(expected_save_path):
+                                        # 检查MD5是否相同
+                                        if self.is_same_image_by_md5(cover_path, expected_save_path):
+                                            print(f"[DEBUG] 扫描时跳过封面保存: {dir_path} (MD5相同)")
+                                            continue  # 跳过保存
+                    
                                     if self.save_cover_image(dir_path, cover_path):
                                         saved_count += 1
 
@@ -2833,36 +2861,87 @@ class DirectoryScannerApp(QMainWindow):
             # 获取封面图片路径
             cover_path = self.find_cover_image(path)
             
-            # 过滤掉封面图片
-            other_images = []
+            # === 新增：MD5指纹去重逻辑 ===
+            unique_images = []
+            seen_md5s = set()
+            
+            # 首先计算封面图片的MD5（如果存在）
+            cover_md5 = None
+            if cover_path and os.path.exists(cover_path):
+                try:
+                    with open(cover_path, 'rb') as f:
+                        file_hash = hashlib.md5()
+                        while chunk := f.read(8192):
+                            file_hash.update(chunk)
+                        cover_md5 = file_hash.hexdigest()
+                except Exception as e:
+                    print(f"[WARNING] 计算封面图片MD5失败 {cover_path}: {e}")
+            
             for img in all_images:
                 # 使用绝对路径比较，确保封面图片不会被包含在其他缩略图中
                 if cover_path and os.path.abspath(img) == os.path.abspath(cover_path):
                     continue  # 跳过封面图片
-                other_images.append(img)
+                
+                # 计算图片的MD5指纹
+                try:
+                    with open(img, 'rb') as f:
+                        file_hash = hashlib.md5()
+                        while chunk := f.read(8192):
+                            file_hash.update(chunk)
+                        md5_value = file_hash.hexdigest()
+                    
+                    # 如果这个MD5值与封面图片相同，跳过
+                    if cover_md5 and md5_value == cover_md5:
+                        print(f"[DEBUG] 跳过与封面相同的图片: {img} (MD5指纹相同)")
+                        continue
+                    
+                    # 如果这个MD5值还没出现过，添加到唯一列表
+                    if md5_value not in seen_md5s:
+                        seen_md5s.add(md5_value)
+                        unique_images.append(img)
+                    else:
+                        print(f"[DEBUG] 跳过重复图片: {img} (MD5指纹相同)")
+                        
+                except Exception as e:
+                    # 如果计算MD5失败，仍然保留该图片
+                    print(f"[WARNING] 计算MD5失败 {img}: {e}")
+                    unique_images.append(img)
             
-            max_thumbnails = len(other_images)
+            # 限制最大显示缩略图数量为8个
+            max_thumbnails = min(len(unique_images), 8)  # 最多显示8个其他缩略图
+            
+            # === 修复：存储图片路径到widget属性中 ===
+            container.thumbnail_paths = unique_images[:max_thumbnails]  # 存储缩略图路径
             
             for i in range(max_thumbnails):
                 thumb_label = QLabel()
                 thumb_label.setFixedSize(180, 120)  # 跟封面一样的尺寸
                 thumb_label.setAlignment(Qt.AlignCenter)
-                thumb_label.setCursor(Qt.PointingHandCursor)  # 添加手型光标，提示可点击
+                thumb_label.setCursor(Qt.PointingHandCursor)  # 添加手型光标
             
-                if i < len(other_images):
-                    self.set_preview_image(thumb_label, other_images[i])
-                    # 为缩略图设置点击事件
-                    thumb_label.mousePressEvent = lambda event, img_path=other_images[i]: self.on_image_clicked(event, img_path)
+                if i < len(unique_images):
+                    self.set_preview_image(thumb_label, unique_images[i])
+                    # 为缩略图设置点击事件 - 使用正确的方法
+                    thumb_label.mousePressEvent = self.create_thumbnail_click_handler(unique_images[i])
                 else:
                     thumb_label.setText("")
                 
                 layout.addWidget(thumb_label)
         
+            # 如果还有其他图片但被限制了显示，显示提示信息
+            if len(unique_images) > max_thumbnails:
+                more_label = QLabel(f"+{len(unique_images) - max_thumbnails}更多")
+                more_label.setAlignment(Qt.AlignCenter)
+                more_label.setStyleSheet("color: #666; font-size: 12px;")
+                layout.addWidget(more_label)
+
         else:  # 如果是文件
             # 单个文件不需要其他缩略图
             pass
         
         return container
+
+
 
 
 
@@ -2884,10 +2963,13 @@ class DirectoryScannerApp(QMainWindow):
             # 按文件名排序，确保封面和缩略图顺序一致
             images.sort()
             
+            
         except PermissionError:
             pass
         
         return images
+
+
 
 
 
@@ -3605,69 +3687,47 @@ class DirectoryScannerApp(QMainWindow):
             
 
     def setup_image_click_events(self):
-        """为所有图片设置点击事件"""
+        """为所有图片设置点击事件 - 完全重写版本"""
         if not hasattr(self, 'table_widget'):
             return
         
         for row in range(self.table_widget.rowCount()):
-            # 封面图片点击事件
+            # 1. 设置封面图片点击事件
             cover_widget = self.table_widget.cellWidget(row, 0)
             if cover_widget and isinstance(cover_widget, QLabel):
-                # 获取该行的路径信息
                 path_item = self.table_widget.item(row, 4)
                 if path_item:
                     path = path_item.text()
-                    is_directory_item = self.table_widget.item(row, 1)  # 假设第二列有目录信息
-                    
-                    if is_directory_item:
-                        # 如果是目录，查找封面图片路径
-                        cover_path = self.find_cover_image(path)
-                        if cover_path:
-                            # 移除原有的事件过滤器（如果有）
-                            cover_widget.mousePressEvent = lambda event, img_path=cover_path: self.on_image_clicked(event, img_path)
+                    cover_path = self.find_cover_image(path)
+                    if cover_path:
+                        # 使用新的点击处理器
+                        cover_widget.mousePressEvent = self.create_thumbnail_click_handler(cover_path)
             
-            # 其他缩略图点击事件 - 修复索引计算问题
+            # 2. 设置其他缩略图点击事件
             thumbnails_widget = self.table_widget.cellWidget(row, 2)
-            if thumbnails_widget:
-                # 查找所有缩略图标签
+            if thumbnails_widget and hasattr(thumbnails_widget, 'thumbnail_paths'):
+                # 使用存储的缩略图路径
+                thumbnail_paths = thumbnails_widget.thumbnail_paths
+                
+                # 遍历所有缩略图标签
                 for i in range(thumbnails_widget.layout().count()):
                     thumb_label = thumbnails_widget.layout().itemAt(i).widget()
-                    if thumb_label and isinstance(thumb_label, QLabel):
-                        # 获取该缩略图对应的图片路径
-                        path_item = self.table_widget.item(row, 4)
-                        if path_item:
-                            path = path_item.text()
-                            # 查找该目录中的所有图片
-                            all_images = self.find_all_images(path)
-                            
-                            # 获取封面图片路径
-                            cover_path = self.find_cover_image(path)
-                            
-                            # 过滤掉封面图片，获取其他图片列表
-                            other_images = []
-                            for img in all_images:
-                                if cover_path and os.path.abspath(img) == os.path.abspath(cover_path):
-                                    continue  # 跳过封面图片
-                                other_images.append(img)
-                            
-                            # 按文件名排序确保顺序一致
-                            other_images.sort()
-                            
-                            # 修复：确保索引正确对应
-                            if i < len(other_images):
-                                img_path = other_images[i]
-                                # 使用闭包确保每个缩略图都有正确的图片路径
-                                thumb_label.mousePressEvent = lambda event, img_path=img_path, row=row, idx=i: self.on_thumbnail_clicked(event, img_path, row, idx)
+                    if (thumb_label and isinstance(thumb_label, QLabel) and 
+                        thumb_label.pixmap() is not None and i < len(thumbnail_paths)):
+                        # 为每个缩略图设置正确的点击事件
+                        thumb_label.mousePressEvent = self.create_thumbnail_click_handler(thumbnail_paths[i])
+
 
 
 
     def on_image_clicked(self, event, image_path):
-        """处理图片点击事件"""
+        """处理图片点击事件 - 保持兼容性"""
         if event.button() == Qt.LeftButton:  # 左键点击
             self.show_full_image(image_path)
         else:
             # 调用原有的鼠标事件处理
             QLabel.mousePressEvent(self.sender(), event)
+
 
     def get_cover_save_settings(self):
         """获取封面保存设置"""
@@ -3688,10 +3748,10 @@ class DirectoryScannerApp(QMainWindow):
             return False
         
         cover_save_mode = self.get_setting('cover_save_mode', 'smart')
-    
+
         # === 新增：检查是否开启"封面备份存在则跳过" ===
         skip_existing = self.get_setting('skip_existing_covers', '1') == '1'
-    
+
         # 获取目录名称
         dir_name = os.path.basename(directory_path)
         
@@ -3720,12 +3780,17 @@ class DirectoryScannerApp(QMainWindow):
             if not save_path:
                 print(f"[DEBUG] 无法生成保存路径: {dir_name}")
                 return False
-        
+
             # === 新增：检查封面是否已存在，如果存在且开启跳过选项，则直接返回 ===
             if skip_existing and os.path.exists(save_path):
-                print(f"[DEBUG] 封面已存在，跳过保存: {save_path}")
-                return True  # 返回True表示"跳过"是预期行为
-        
+                # === 新增：检查MD5是否相同 ===
+                if self.is_same_image_by_md5(cover_image_path, save_path):
+                    print(f"[DEBUG] 封面已存在且MD5相同，跳过保存: {save_path}")
+                    return True  # 返回True表示"跳过"是预期行为
+                else:
+                    print(f"[DEBUG] 封面已存在但MD5不同，继续保存: {save_path}")
+                    # MD5不同，继续保存流程
+            
             # 确保目标目录存在
             target_dir = os.path.dirname(save_path)
             os.makedirs(target_dir, exist_ok=True)
@@ -3736,9 +3801,11 @@ class DirectoryScannerApp(QMainWindow):
                 print(f"[DEBUG] 封面保存成功: {save_path}")
                 return True
             else:
-                print(f"[DEBUG] 封面已存在: {save_path}")
-                return True  # 已存在也算成功
-                
+                # 如果文件已存在但MD5不同，覆盖保存
+                shutil.copy2(cover_image_path, save_path)
+                print(f"[DEBUG] 封面已存在但MD5不同，已覆盖保存: {save_path}")
+                return True
+                    
         except Exception as e:
             print(f"[ERROR] 保存封面图片失败: {e}")
             print(f"[DEBUG] 目录: {directory_path}")
@@ -3746,6 +3813,7 @@ class DirectoryScannerApp(QMainWindow):
             print(f"[DEBUG] 目标路径: {save_path if 'save_path' in locals() else 'N/A'}")
         
         return False
+
 
 
     def is_av_format(self, dir_name):
@@ -3819,6 +3887,9 @@ class DirectoryScannerApp(QMainWindow):
             return
 
         cover_save_mode = self.get_setting('cover_save_mode', 'smart')
+    
+        # === 新增：获取跳过设置 ===
+        skip_existing = self.get_setting('skip_existing_covers', '1') == '1'  # 新增这行
 
         # 确认操作
         reply = QMessageBox.question(
@@ -3862,6 +3933,14 @@ class DirectoryScannerApp(QMainWindow):
                 if os.path.exists(dir_path):
                     cover_path = self.find_cover_image(dir_path)
                     if cover_path and os.path.exists(cover_path):
+                        # 新增：检查是否需要跳过
+                        expected_save_path = self.get_expected_cover_path(dir_path, cover_save_dir, cover_save_mode)
+                        if skip_existing and expected_save_path and os.path.exists(expected_save_path):
+                            # 检查MD5是否相同
+                            if self.is_same_image_by_md5(cover_path, expected_save_path):
+                                print(f"[DEBUG] 批量保存时跳过封面: {dir_path} (MD5相同)")
+                                continue  # 跳过保存
+            
                         if self.save_cover_image(dir_path, cover_path):
                             saved_count += 1
                         else:
@@ -4130,6 +4209,42 @@ class DirectoryScannerApp(QMainWindow):
         except Exception as e:
             print(f"[DEBUG] 获取保存封面路径失败: {e}")
             return None
+
+    def is_same_image_by_md5(self, img_path1, img_path2):
+        """通过MD5比较两个图片文件是否相同"""
+        if not os.path.exists(img_path1) or not os.path.exists(img_path2):
+            return False
+        
+        try:
+            # 计算第一个图片的MD5
+            with open(img_path1, 'rb') as f1:
+                hash1 = hashlib.md5()
+                while chunk := f1.read(8192):
+                    hash1.update(chunk)
+            
+            # 计算第二个图片的MD5
+            with open(img_path2, 'rb') as f2:
+                hash2 = hashlib.md5()
+                while chunk := f2.read(8192):
+                    hash2.update(chunk)
+            
+            # 比较MD5值
+            return hash1.hexdigest() == hash2.hexdigest()
+            
+        except Exception as e:
+            print(f"[WARNING] MD5比较失败 {img_path1} vs {img_path2}: {e}")
+            return False
+
+    def create_thumbnail_click_handler(self, image_path):
+        """创建缩略图点击事件处理器 - 修复变量捕获问题"""
+        def thumbnail_click_handler(event):
+            if event.button() == Qt.LeftButton:
+                self.show_full_image(image_path)
+            else:
+                # 调用原有的鼠标事件处理
+                if hasattr(self.sender(), 'mousePressEvent'):
+                    QLabel.mousePressEvent(self.sender(), event)
+        return thumbnail_click_handler
 
 
 # 主程序
