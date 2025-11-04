@@ -35,8 +35,8 @@ if pinyin_available:
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "2.50.0"
-    BUILD_DATE = "2025-11-03"
+    VERSION = "2.51.0"
+    BUILD_DATE = "2025-11-04"
     # from datetime import datetime
     # BUILD_DATE = datetime.now().strftime("%Y-%m-%d")  # 修改为动态获取当前日期
     AUTHOR = "杜玛"
@@ -49,7 +49,7 @@ class ProjectInfo:
 
     # 补充完整的版本历史
     VERSION_HISTORY = {
-        "2.50.0": "修复一些错位",
+        "2.51.0": "后台扫描也显示进度条",
         "2.42.0": "增强保存封面，扫描进度条",
         "2.33.0": "增强图片点击查看功能",
         "2.27.0": "增强拼音搜索功能，优化数据库性能，修复扫描模式设置问题",
@@ -61,11 +61,14 @@ class ProjectInfo:
     }
     
     # 补充完整的使用说明
-    HELP_TEXT = """
+    @classmethod
+    def get_help_text(cls) -> str:
+        """获取完整的帮助文本"""
+        return f"""
 使用说明:
 
-版本: 2.42.0
-作者: 杜玛
+版本: {cls.VERSION}
+作者: {cls.AUTHOR}
 
 主要功能:
 1. 多用户目录管理 - 支持多个用户独立管理各自的目录
@@ -73,7 +76,7 @@ class ProjectInfo:
 3. 自动备份恢复 - 定期自动备份数据库，支持手动恢复
 4. 图片预览功能 - 自动识别并预览目录中的图片
 5. 可配置扫描 - 支持设置扫描深度和过滤条件
-6. 主目录管理 - 支持管理多个主目录并分别设置扫描深度
+6. 实时进度显示 - 任何扫描活动都会显示详细进度条
 
 使用步骤:
 1. 首次使用请创建或选择用户
@@ -86,6 +89,13 @@ class ProjectInfo:
 - 仅扫描目录: 只扫描文件夹，忽略文件
 - 仅扫描文件: 只扫描文件，忽略文件夹  
 - 扫描目录和文件: 同时扫描文件夹和文件
+
+进度条说明:
+- 文件系统扫描 (0-30%): 正在遍历目录结构
+- 数据库保存 (30-50%): 正在保存扫描结果到数据库
+- 创建备份 (50-70%): 正在创建数据库备份
+- 封面保存 (70-90%): 正在保存封面图片
+- 完成 (100%): 扫描完成
 
 搜索功能:
 - 支持中文名称搜索
@@ -102,7 +112,7 @@ class ProjectInfo:
 - 数据恢复: 支持从备份文件恢复数据
 - 清除数据: 可清除用户的扫描记录
 
-技术支持: https://github.com/duma520
+技术支持: {cls.URL}
 """
 
 
@@ -2069,11 +2079,12 @@ class DirectoryScannerApp(QMainWindow):
             conn = sqlite3.connect(self.user_manager.current_db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT value FROM settings WHERE key = 'scan_mode'")
-        result = cursor.fetchone()
-        if result:
-            scan_mode = result[0]
+            result = cursor.fetchone()
+            if result:
+                scan_mode = result[0]
+            conn.close()
         
-        # === 新增：显示进度条 ===
+        # === 确保进度条显示 ===
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText(f"正在扫描目录: {path}...")
@@ -2083,7 +2094,7 @@ class DirectoryScannerApp(QMainWindow):
             # 传入扫描模式参数
             dirs = self.scan_directory_with_depth(path, depth, scan_mode)
         
-            # === 新增：更新进度条 ===
+            # === 更新进度条 - 扫描完成 ===
             self.progress_bar.setValue(50)
             self.progress_label.setText("正在保存到数据库...")
             QApplication.processEvents()
@@ -2101,31 +2112,39 @@ class DirectoryScannerApp(QMainWindow):
                 invalid_dirs_count = 0
                 duplicate_paths = set()
                 
-                for dir_info in dirs:
+                # === 新增：数据库保存进度 ===
+                total_dirs = len(dirs)
+                for j, dir_info in enumerate(dirs):
+                    # 更新数据库保存进度
+                    if j % 10 == 0:  # 每10个项目更新一次进度
+                        db_progress = 50 + int((j / total_dirs) * 20)  # 数据库保存占20%
+                        self.progress_bar.setValue(db_progress)
+                        self.progress_label.setText(f"正在保存到数据库... ({j}/{total_dirs})")
+                        QApplication.processEvents()
+                    
                     # 更严格的数据验证
                     name = dir_info.get("name", "").strip() if dir_info.get("name") else ""
-                    path = dir_info.get("path", "").strip() if dir_info.get("path") else ""
+                    dir_path = dir_info.get("path", "").strip() if dir_info.get("path") else ""
                     
                     # 如果没有目录名称或没有路径，跳过不添加到列表
-                    if not name or not path:
+                    if not name or not dir_path:
                         invalid_dirs_count += 1
-                        print(f"[DEBUG] 跳过空名称或空路径的目录: {dir_info}")
                         continue
                     
                     # 其他验证条件
-                    if (name and path and
+                    if (name and dir_path and
                         dir_info.get("created_time") and dir_info.get("last_modified") and
-                        path not in duplicate_paths):  # 防止重复路径
+                        dir_path not in duplicate_paths):  # 防止重复路径
                         
                         # 检查路径是否实际存在
-                        if os.path.exists(path):
+                        if os.path.exists(dir_path):
                             cursor.execute("""
                                 INSERT INTO directories 
                                 (name, path, created_time, last_modified, directory_exists, last_scanned, is_main_dir, is_directory)
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                             """, (
                                 name,
-                                path,
+                                dir_path,
                                 dir_info["created_time"],
                                 dir_info["last_modified"],
                                 1,
@@ -2134,18 +2153,16 @@ class DirectoryScannerApp(QMainWindow):
                                 dir_info["is_directory"]
                             ))
                             valid_dirs_count += 1
-                            duplicate_paths.add(path)  # 记录已处理的路径
+                            duplicate_paths.add(dir_path)  # 记录已处理的路径
                         else:
                             invalid_dirs_count += 1
-                            print(f"[DEBUG] 跳过不存在的路径: {path}")
                     else:
                         invalid_dirs_count += 1
-                        print(f"[DEBUG] 跳过无效数据: {dir_info}")
                 
                 conn.commit()
                 
-                # === 新增：更新进度条 ===
-                self.progress_bar.setValue(75)
+                # === 更新进度条 - 数据库保存完成 ===
+                self.progress_bar.setValue(70)
                 self.progress_label.setText("正在创建备份...")
                 QApplication.processEvents()
                 
@@ -2155,8 +2172,8 @@ class DirectoryScannerApp(QMainWindow):
                 # 保存主目录设置
                 self.save_main_directory_settings()
             
-                # === 新增：更新进度条 ===
-                self.progress_bar.setValue(90)
+                # === 更新进度条 - 备份完成 ===
+                self.progress_bar.setValue(80)
                 self.progress_label.setText("正在保存封面图片...")
                 QApplication.processEvents()
 
@@ -2164,13 +2181,13 @@ class DirectoryScannerApp(QMainWindow):
                 # 检查是否开启了"扫描时保存封面"选项
                 scan_save_cover = self.get_setting('scan_save_cover', '0') == '1'
                 cover_save_mode, cover_save_dir = self.get_cover_save_settings()
-                skip_existing = self.get_setting('skip_existing_covers', '1') == '1'  # 新增：获取跳过设置
+                skip_existing = self.get_setting('skip_existing_covers', '1') == '1'
                 
                 if scan_save_cover and cover_save_dir:  # 只有在开启了选项且设置了保存目录时才保存封面
                     saved_count = 0
-                    total_dirs = len([d for d in dirs if d.get("is_directory", 1) == 1])
+                    total_dirs_for_cover = len([d for d in dirs if d.get("is_directory", 1) == 1])
 
-                    for i, dir_info in enumerate(dirs):                    
+                    for k, dir_info in enumerate(dirs):                    
                         if dir_info.get("is_directory", 1) == 1:  # 只处理目录
                             dir_path = dir_info["path"]
                             if os.path.exists(dir_path):
@@ -2181,23 +2198,22 @@ class DirectoryScannerApp(QMainWindow):
                                     if skip_existing and expected_save_path and os.path.exists(expected_save_path):
                                         # 检查MD5是否相同
                                         if self.is_same_image_by_md5(cover_path, expected_save_path):
-                                            print(f"[DEBUG] 扫描时跳过封面保存: {dir_path} (MD5相同)")
                                             continue  # 跳过保存
-                    
+                
                                     if self.save_cover_image(dir_path, cover_path):
                                         saved_count += 1
 
-                            # === 新增：更新封面保存进度 ===
-                            if total_dirs > 0:
-                                progress_value = 90 + int((i + 1) / total_dirs * 10)
-                                self.progress_bar.setValue(progress_value)
-                                self.progress_label.setText(f"正在保存封面图片... ({i+1}/{total_dirs})")
+                            # === 更新封面保存进度 ===
+                            if total_dirs_for_cover > 0:
+                                cover_progress = 80 + int((k + 1) / total_dirs_for_cover * 20)
+                                self.progress_bar.setValue(cover_progress)
+                                self.progress_label.setText(f"正在保存封面图片... ({k+1}/{total_dirs_for_cover})")
                                 QApplication.processEvents()
                 
                     if saved_count > 0:
                         self.statusBar().showMessage(f"扫描完成，保存了 {saved_count} 个封面")
             
-                # === 新增：完成进度 ===
+                # === 完成进度 ===
                 self.progress_bar.setValue(100)
                 self.progress_label.setText("扫描完成")
                 
@@ -2208,7 +2224,7 @@ class DirectoryScannerApp(QMainWindow):
                 self.statusBar().showMessage(stats_msg)
 
         except Exception as e:
-            # === 新增：扫描失败时更新进度条 ===
+            # === 扫描失败时更新进度条 ===
             self.progress_bar.setValue(0)
             self.progress_label.setText("扫描失败")
             self.statusBar().showMessage("扫描失败")
@@ -2217,6 +2233,7 @@ class DirectoryScannerApp(QMainWindow):
         finally:
             if 'conn' in locals():
                 conn.close()
+
         
             # === 新增：扫描完成后隐藏进度条 ===
             QTimer.singleShot(2000, self.hide_progress_bar)  # 2秒后隐藏
@@ -2610,7 +2627,7 @@ class DirectoryScannerApp(QMainWindow):
             QMessageBox.warning(self, "无主目录", "请先添加主目录")
             return
         
-        # === 新增：多目录扫描进度显示 ===
+        # === 确保进度条显示 ===
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText(f"准备扫描 {len(main_dirs)} 个主目录...")
@@ -2632,13 +2649,14 @@ class DirectoryScannerApp(QMainWindow):
         # 加载最新的目录列表
         self.load_directories()
         
-        # === 新增：完成多目录扫描 ===
+        # === 完成扫描 ===
         self.progress_bar.setValue(100)
         self.progress_label.setText("所有主目录扫描完成")
         self.statusBar().showMessage("所有主目录扫描完成")
         
-        # 2秒后隐藏进度条
-        QTimer.singleShot(2000, self.hide_progress_bar)
+        # 3秒后隐藏进度条，给用户足够时间看到完成状态
+        QTimer.singleShot(3000, self.hide_progress_bar)
+        
 
     
 
@@ -3066,7 +3084,24 @@ class DirectoryScannerApp(QMainWindow):
         
         if auto_scan:
             try:
+                # === 新增：在自动扫描开始时显示进度条 ===
+                def auto_scan_with_progress():
+                    self.progress_bar.setVisible(True)
+                    self.progress_bar.setValue(0)
+                    self.progress_label.setText("自动扫描开始...")
+                    QApplication.processEvents()
+
+                    # 执行扫描
+                    self.scan_directories()
+                    
+                    # 扫描完成后延迟隐藏进度条
+                    QTimer.singleShot(3000, self.hide_progress_bar)
+                
+                # 设置定时器调用带进度条的扫描函数
+                self.scan_timer.timeout.disconnect()
+                self.scan_timer.timeout.connect(auto_scan_with_progress)
                 self.scan_timer.start(interval)
+
                 print(f"[SUCCESS] 自动扫描定时器已启动，间隔: {interval/1000}秒")
                 return True
             except Exception as e:
@@ -3275,6 +3310,10 @@ class DirectoryScannerApp(QMainWindow):
         # 记录当前使用的扫描模式
         print(f"[DEBUG] 使用扫描模式: {scan_mode}")
 
+        # === 新增：扫描进度统计 ===
+        total_items_processed = 0
+        estimated_total = 1000  # 预估总数，会在扫描过程中调整
+    
         
         # 使用队列进行广度优先搜索
         from collections import deque
@@ -3291,7 +3330,17 @@ class DirectoryScannerApp(QMainWindow):
             if current_path in processed_paths:
                 continue
             processed_paths.add(current_path)
-            
+        
+            # === 新增：实时更新扫描进度 ===
+            total_items_processed += 1
+            if total_items_processed % 10 == 0:  # 每处理10个项目更新一次进度
+                progress_percent = min(30, int((total_items_processed / estimated_total) * 30))  # 扫描阶段占30%
+                current_progress = self.progress_bar.value()
+                if progress_percent > current_progress:
+                    self.progress_bar.setValue(progress_percent)
+                    self.progress_label.setText(f"正在扫描文件系统... ({total_items_processed} 个项目)")
+                    QApplication.processEvents()
+        
             try:
                 # 检查路径是否存在且可访问
                 if not os.path.exists(current_path):
@@ -3339,11 +3388,19 @@ class DirectoryScannerApp(QMainWindow):
                 # 如果是目录且不是最大深度，则添加子项到队列
                 if is_dir and current_depth < max_depth:
                     try:
+                        sub_items = []
                         for entry in os.listdir(current_path):
                             full_path = os.path.join(current_path, entry)
                             # 过滤掉隐藏文件和系统文件
                             if not entry.startswith('.') and not entry.startswith('~'):
-                                queue.append((full_path, current_depth + 1))
+                                sub_items.append(full_path)
+                    
+                        # 更新预估总数
+                        estimated_total += len(sub_items)
+                        
+                        for full_path in sub_items:
+                            queue.append((full_path, current_depth + 1))
+                            
                     except (PermissionError, FileNotFoundError):
                         continue
                         
@@ -3537,7 +3594,8 @@ class DirectoryScannerApp(QMainWindow):
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
         
-        version_label = QLabel(f"版本: {about_info['version']} | 构建日期: {about_info['build_date']}")
+        # 使用动态版本号
+        version_label = QLabel(f"版本: {ProjectInfo.VERSION} | 构建日期: {ProjectInfo.BUILD_DATE}")  # 直接使用类属性
         version_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(version_label)
         
@@ -4245,6 +4303,15 @@ class DirectoryScannerApp(QMainWindow):
                 if hasattr(self.sender(), 'mousePressEvent'):
                     QLabel.mousePressEvent(self.sender(), event)
         return thumbnail_click_handler
+
+    def show_scan_progress(self, message, value=None):
+        """显示扫描进度"""
+        self.progress_bar.setVisible(True)
+        if value is not None:
+            self.progress_bar.setValue(value)
+        self.progress_label.setText(message)
+        QApplication.processEvents()
+
 
 
 # 主程序
