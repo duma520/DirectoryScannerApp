@@ -9,6 +9,13 @@ import time
 import re
 import glob
 import hashlib
+import subprocess
+import http.server
+import socketserver
+import threading
+import json
+import urllib.parse
+from http import HTTPStatus
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QMessageBox, QDialog, QComboBox, QSpinBox, 
@@ -16,7 +23,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QDateEdit, QToolButton, QSizePolicy, QStackedWidget, QAction,
                              QMenu, QSystemTrayIcon, QScrollArea, QInputDialog, QFrame, 
                              QTextEdit, QProgressDialog, QProgressBar)
-from PyQt5.QtCore import Qt, QTimer, QDateTime, QSize, QSettings, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QDateTime, QSize, QSettings, pyqtSignal, QThread
+from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
 from PyQt5.QtGui import (QIcon, QColor, QFont, QPixmap, QBrush, QColor, QPixmap)
 from PyQt5.QtSql import QSqlDatabase, QSqlQuery, QSqlTableModel
 # 添加拼音转换库
@@ -35,8 +43,8 @@ if pinyin_available:
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "2.51.0"
-    BUILD_DATE = "2025-11-04"
+    VERSION = "2.91.0"
+    BUILD_DATE = "2025-11-09"
     # from datetime import datetime
     # BUILD_DATE = datetime.now().strftime("%Y-%m-%d")  # 修改为动态获取当前日期
     AUTHOR = "杜玛"
@@ -49,6 +57,10 @@ class ProjectInfo:
 
     # 补充完整的版本历史
     VERSION_HISTORY = {
+        "2.91.0": "web客户端增加在线看视频，pdf，epub等功能",
+        "2.79.0": "web客户端改为纯HTML5格式，提升兼容性和性能",
+        "2.62.0": "增加Web客户端访问功能，支持远程管理",
+        "2.53.0": "优化扫描性能，提升用户体验",
         "2.51.0": "后台扫描也显示进度条",
         "2.42.0": "增强保存封面，扫描进度条",
         "2.33.0": "增强图片点击查看功能",
@@ -255,6 +267,7 @@ class ProjectInfo:
 # 马卡龙色系定义 360色全色域
 class MacaronColors:
     # 马卡龙色系 360色全色域
+    PEACH_BLOSSOM = QColor('#F4A8B0')  # 桃红色
     PINK_BLOSSOM = QColor('#F2A9A9') #粉红花
     PINK_CORAL = QColor('#F2A6A4') #粉珊瑚
     PEACH_BLUSH = QColor('#F2A29F') #桃腮红
@@ -686,6 +699,3355 @@ class PinyinSearchHelper:
 
 
 
+class DirectoryScannerHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    """目录扫描系统的HTTP请求处理器"""
+
+    def __init__(self, *args, main_app=None, open_directory_callback=None, **kwargs):
+        self.main_app = main_app
+        self.open_directory_callback = open_directory_callback
+        super().__init__(*args, **kwargs)
+
+    
+    def do_GET(self):
+        """处理GET请求"""
+        try:
+            parsed_path = urllib.parse.urlparse(self.path)
+            path = parsed_path.path
+
+            print(f"[HTTP DEBUG] 请求路径: {path}")
+
+            # 静态文件服务
+            if path.startswith('/static/'):
+                self.handle_static_file(path)
+            elif path == '/':
+                self.send_html_response(self.get_index_html())
+            elif path == '/api/directories':
+                self.send_json_response(self.get_directories_data())
+            elif path == '/api/directories/search':
+                self.handle_search_request(parsed_path.query)
+            elif path == '/api/cover':
+                self.handle_cover_request(parsed_path.query)
+            elif path == '/api/video':  
+                self.handle_video_request(parsed_path.query)
+            elif path == '/api/pdf':
+                self.handle_pdf_request(parsed_path.query)
+            elif path == '/api/document':
+                self.handle_document_request(parsed_path.query)
+            elif path == '/api/open':
+                self.handle_open_request(parsed_path.query)
+            elif path == '/api/scan':
+                self.handle_scan_request()
+            elif path == '/api/status':
+                self.send_json_response(self.get_system_status())
+            elif path.startswith('/api/directory/'):
+                self.handle_get_directory(parsed_path.path)
+            else:
+                # 尝试提供静态文件
+                super().do_GET()
+                
+        except Exception as e:
+            print(f"[HTTP ERROR] 处理GET请求时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    def handle_static_file(self, path):
+        """处理静态文件请求"""
+        try:
+            # 安全的路径处理
+            safe_path = path.lstrip('/')
+            if '..' in safe_path or safe_path.startswith('static/') is False:
+                self.send_error(HTTPStatus.FORBIDDEN, "Invalid path")
+                return
+            
+            # 构建本地文件路径
+            static_dir = os.path.join(self.main_app.app_dir, "static")
+            file_path = os.path.join(static_dir, safe_path.replace('static/', '', 1))
+            
+            # 检查文件是否存在
+            if not os.path.exists(file_path) or not os.path.isfile(file_path):
+                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+                return
+            
+            # 根据文件扩展名设置MIME类型
+            ext = os.path.splitext(file_path)[1].lower()
+            mime_types = {
+                '.js': 'application/javascript',
+                '.css': 'text/css',
+                '.html': 'text/html',
+                '.png': 'image/png',
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.gif': 'image/gif',
+                '.ico': 'image/x-icon'
+            }
+            content_type = mime_types.get(ext, 'application/octet-stream')
+            
+            # 发送文件
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+            
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-type', content_type)
+            self.send_header('Content-Length', str(len(file_data)))
+            self.send_header('Cache-Control', 'public, max-age=3600')  # 缓存1小时
+            self.end_headers()
+            self.wfile.write(file_data)
+            
+        except Exception as e:
+            print(f"[STATIC ERROR] 处理静态文件失败: {e}")
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    def handle_video_request(self, query_string):
+        """处理视频流请求 - 增强版本，添加连接异常处理"""
+        query_params = urllib.parse.parse_qs(query_string)
+        path = query_params.get('path', [''])[0]
+        
+        if not path:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing path parameter")
+            return
+        
+        try:
+            video_path = urllib.parse.unquote(path)
+            
+            # 路径规范化
+            if self.main_app and hasattr(self.main_app, 'normalize_path_separators'):
+                video_path = self.main_app.normalize_path_separators(video_path)
+            
+            # 检查文件是否存在且是视频文件
+            if not os.path.exists(video_path):
+                self.send_error(HTTPStatus.NOT_FOUND, "Video file not found")
+                return
+            
+            # 检查文件类型
+            video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v']
+            file_ext = os.path.splitext(video_path)[1].lower()
+            if file_ext not in video_extensions:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Not a video file")
+                return
+            
+            # 获取文件大小
+            file_size = os.path.getsize(video_path)
+            
+            # 处理范围请求（支持视频seek）
+            range_header = self.headers.get('Range', '')
+            byte_range = None
+            
+            if range_header:
+                # 解析范围请求，格式：bytes=start-end
+                range_match = re.match(r'bytes=(\d+)-(\d+)?', range_header)
+                if range_match:
+                    start = int(range_match.group(1))
+                    end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
+                    byte_range = (start, end)
+            
+            # 发送视频文件
+            self.send_video_file(video_path, file_size, byte_range)
+            
+        except ConnectionResetError:
+            # 客户端主动断开连接，这是正常现象，不记录为错误
+            print(f"[INFO] 客户端断开视频连接: {path}")
+            return
+        except Exception as e:
+            print(f"[SERVER ERROR] 处理视频请求失败: {e}")
+            # 使用安全的错误发送方法
+            self.send_safe_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    def send_video_file(self, video_path, file_size, byte_range=None):
+        """发送视频文件，支持范围请求 - 增强版本"""
+        try:
+            # 确定MIME类型
+            ext = os.path.splitext(video_path)[1].lower()
+            mime_types = {
+                '.mp4': 'video/mp4',
+                '.avi': 'video/x-msvideo',
+                '.mkv': 'video/x-matroska',
+                '.mov': 'video/quicktime',
+                '.wmv': 'video/x-ms-wmv',
+                '.flv': 'video/x-flv',
+                '.webm': 'video/webm',
+                '.m4v': 'video/x-m4v'
+            }
+            content_type = mime_types.get(ext, 'video/mp4')
+            
+            if byte_range:
+                # 处理部分内容请求
+                start, end = byte_range
+                content_length = end - start + 1
+                
+                self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(content_length))
+                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                self.send_header('Accept-Ranges', 'bytes')
+                self.end_headers()
+                
+                # 发送指定范围的数据
+                with open(video_path, 'rb') as f:
+                    f.seek(start)
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk_size = min(8192, remaining)
+                        try:
+                            chunk = f.read(chunk_size)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                        except ConnectionResetError:
+                            # 客户端断开连接，正常退出
+                            print(f"[INFO] 视频流传输中断: {video_path}")
+                            return
+            else:
+                # 发送完整文件
+                self.send_response(HTTPStatus.OK)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.end_headers()
+                
+                # 发送整个文件
+                with open(video_path, 'rb') as f:
+                    while chunk := f.read(8192):
+                        try:
+                            self.wfile.write(chunk)
+                        except ConnectionResetError:
+                            # 客户端断开连接，正常退出
+                            print(f"[INFO] 视频流传输中断: {video_path}")
+                            return
+                            
+        except ConnectionResetError:
+            # 客户端主动断开连接，这是正常现象
+            print(f"[INFO] 客户端断开视频连接: {video_path}")
+            return
+        except Exception as e:
+            print(f"[SERVER ERROR] 发送视频文件失败: {e}")
+            self.send_safe_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    def send_safe_error(self, code, message):
+        """安全发送错误响应，避免编码问题"""
+        try:
+            # 确保消息是ASCII安全的
+            safe_message = message.encode('ascii', 'ignore').decode('ascii')
+            if not safe_message:
+                safe_message = "Internal Server Error"
+            
+            self.send_error(code, safe_message)
+        except Exception as e:
+            # 如果发送错误也失败，记录日志并返回基本错误
+            print(f"[CRITICAL] 发送错误响应失败: {e}")
+            try:
+                self.send_error(code, "Error")
+            except:
+                pass  # 最终放弃
+
+    def handle_get_directory(self, path):
+        """处理获取单个目录信息的请求"""
+        try:
+            # 从路径中提取目录ID
+            dir_id = path.split('/')[-1]
+            if not dir_id.isdigit():
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid directory ID")
+                return
+            
+            if not self.main_app or not self.main_app.user_manager.current_db_path:
+                self.send_json_response({"success": False, "error": "Database not available"})
+                return
+            
+            conn = sqlite3.connect(self.main_app.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, name, path, directory_exists, created_time, last_modified, is_directory 
+                FROM directories 
+                WHERE id = ?
+            """, (dir_id,))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                db_id, name, path, exists, created_time, last_modified, is_directory = result
+                directory_info = {
+                    "id": db_id,
+                    "name": name,
+                    "path": path,
+                    "exists": bool(exists),
+                    "created_time": created_time,
+                    "last_modified": last_modified,
+                    "is_directory": bool(is_directory)
+                }
+                self.send_json_response({"success": True, "directory": directory_info})
+            else:
+                self.send_json_response({"success": False, "error": "Directory not found"})
+                
+        except Exception as e:
+            self.send_json_response({"success": False, "error": str(e)})
+
+    def handle_document_request(self, query_string):
+        """处理文档文件请求"""
+        query_params = urllib.parse.parse_qs(query_string)
+        path = query_params.get('path', [''])[0]
+        preview = query_params.get('preview', [''])[0]
+        
+        if not path:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing path parameter")
+            return
+        
+        try:
+            doc_path = urllib.parse.unquote(path)
+            
+            # 路径规范化
+            if self.main_app and hasattr(self.main_app, 'normalize_path_separators'):
+                doc_path = self.main_app.normalize_path_separators(doc_path)
+            
+            # 检查文件是否存在且是文档文件
+            if not os.path.exists(doc_path):
+                self.send_error(HTTPStatus.NOT_FOUND, "Document file not found")
+                return
+            
+            # 检查文件类型
+            file_ext = os.path.splitext(doc_path)[1].lower()
+            
+            # 特殊处理EPUB文件
+            if file_ext == '.epub':
+                if preview == 'true':
+                    # 提供在线阅读器
+                    self.handle_epub_preview(doc_path)
+                else:
+                    # 直接提供EPUB文件下载
+                    self.send_document_file(doc_path)
+                return
+            
+            document_extensions = [
+                '.pdf', '.txt', '.doc', '.docx', '.ppt', '.pptx', '.xls', 
+                '.xlsx', '.rtf', '.odt', '.ods', '.odp', '.pages', '.numbers',
+                '.key', '.mobi', '.azw', '.azw3', '.fb2', '.lit',
+                '.prc', '.pdb', '.chm', '.djvu', '.djv'
+            ]
+            
+            if file_ext not in document_extensions:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Not a document file")
+                return
+            
+            # 发送其他文档文件
+            self.send_document_file(doc_path)
+            
+        except Exception as e:
+            print(f"[SERVER ERROR] 处理文档请求失败: {e}")
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    def handle_epub_preview(self, epub_path):
+        """处理EPUB文件预览 - 添加缓存优化"""
+        try:
+            # 检查缓存
+            cache_key = hashlib.md5(epub_path.encode()).hexdigest()
+            cached_html = self.get_cached_epub_html(cache_key)
+            
+            if cached_html:
+                print(f"[EPUB CACHE] 使用缓存的EPUB阅读器页面: {epub_path}")
+                self.send_response(HTTPStatus.OK)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(cached_html.encode('utf-8'))))
+                self.end_headers()
+                self.wfile.write(cached_html.encode('utf-8'))
+                return
+            
+            # 创建新的阅读器页面
+            html_content = self.create_epub_reader_html(epub_path)
+            
+            # 缓存结果
+            self.cache_epub_html(cache_key, html_content)
+            
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(html_content.encode('utf-8'))))
+            self.end_headers()
+            self.wfile.write(html_content.encode('utf-8'))
+            
+        except Exception as e:
+            print(f"[SERVER ERROR] 处理EPUB预览失败: {e}")
+            self.handle_epub_fallback(epub_path)
+
+    def get_cached_epub_html(self, cache_key):
+        """获取缓存的EPUB HTML"""
+        # 简单的内存缓存，可以扩展为文件缓存
+        if hasattr(self, '_epub_cache'):
+            return self._epub_cache.get(cache_key)
+        return None
+
+    def cache_epub_html(self, cache_key, html_content):
+        """缓存EPUB HTML"""
+        if not hasattr(self, '_epub_cache'):
+            self._epub_cache = {}
+        self._epub_cache[cache_key] = html_content
+
+    def create_epub_reader_html(self, epub_path):
+        """创建智能EPUB阅读器 - 先本地后网络"""
+        filename = os.path.basename(epub_path)
+        encoded_path = urllib.parse.quote(epub_path)
+        
+        return f'''
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>EPUB阅读器 - {filename}</title>
+        
+        <!-- 智能加载脚本 - 先本地后网络 -->
+        <script>
+            // 智能库加载器 - 优先使用本地文件
+            class SmartLibraryLoader {{
+                constructor() {{
+                    this.libraries = {{
+                        epubjs: {{
+                            local: '/static/epub.js',
+                            cdn: 'https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js',
+                            global: 'ePub',
+                            description: 'EPUB.js'
+                        }},
+                        jszip: {{
+                            local: '/static/jszip.min.js',
+                            cdn: 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+                            global: 'JSZip',
+                            description: 'JSZip'
+                        }}
+                    }};
+                    this.loadedLibraries = new Set();
+                }}
+                
+                // 加载单个库 - 优先本地，失败后使用CDN
+                async loadLibrary(libName) {{
+                    if (this.loadedLibraries.has(libName)) {{
+                        return true;
+                    }}
+                    
+                    const lib = this.libraries[libName];
+                    if (!lib) {{
+                        throw new Error(`未知库: ${{libName}}`);
+                    }}
+                    
+                    console.log(`正在加载 ${{lib.description}}...`);
+                    
+                    // 策略1: 首先尝试本地文件
+                    let success = await this.tryLoad(lib.local, lib.global, lib.description);
+                    
+                    // 策略2: 如果本地失败，尝试CDN
+                    if (!success) {{
+                        console.warn(`${{lib.description}} 本地加载失败，尝试CDN...`);
+                        success = await this.tryLoad(lib.cdn, lib.global, lib.description);
+                    }}
+                    
+                    if (success) {{
+                        this.loadedLibraries.add(libName);
+                        console.log(`✓ ${{lib.description}} 加载成功`);
+                    }} else {{
+                        console.error(`✗ ${{lib.description}} 加载失败`);
+                    }}
+                    
+                    return success;
+                }}
+                
+                // 尝试加载脚本
+                async tryLoad(src, globalVar, description) {{
+                    return new Promise((resolve) => {{
+                        // 检查是否已经全局存在
+                        if (window[globalVar]) {{
+                            console.log(`${{description}} 已存在`);
+                            resolve(true);
+                            return;
+                        }}
+                        
+                        const script = document.createElement('script');
+                        script.src = src;
+                        script.onload = () => {{
+                            // 验证是否真正加载成功
+                            setTimeout(() => {{
+                                if (window[globalVar]) {{
+                                    resolve(true);
+                                }} else {{
+                                    console.warn(`${{description}} 脚本加载但全局变量未定义`);
+                                    resolve(false);
+                                }}
+                            }}, 100);
+                        }};
+                        script.onerror = () => {{
+                            console.warn(`${{description}} 加载失败: ${{src}}`);
+                            resolve(false);
+                        }};
+                        
+                        document.head.appendChild(script);
+                    }});
+                }}
+                
+                // 加载所有必要库
+                async loadAll() {{
+                    const results = await Promise.all([
+                        this.loadLibrary('epubjs'),
+                        this.loadLibrary('jszip')
+                    ]);
+                    
+                    return results.every(success => success);
+                }}
+            }}
+            
+            // 全局加载器实例
+            window.libraryLoader = new SmartLibraryLoader();
+        </script>
+        
+        <style>
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            
+            body {{
+                font-family: 'Microsoft YaHei', Arial, sans-serif;
+                background: #2c3e50;
+                color: #ecf0f1;
+                overflow: hidden;
+                height: 100vh;
+            }}
+            
+            .reader-container {{
+                display: flex;
+                flex-direction: column;
+                height: 100vh;
+            }}
+            
+            /* 顶部工具栏 */
+            .reader-header {{
+                background: #34495e;
+                padding: 12px 20px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 2px solid #1abc9c;
+            }}
+            
+            .reader-title {{
+                font-size: 16px;
+                font-weight: bold;
+                color: #1abc9c;
+            }}
+            
+            .reader-controls {{
+                display: flex;
+                gap: 10px;
+                align-items: center;
+            }}
+            
+            .control-btn {{
+                background: rgba(255,255,255,0.1);
+                border: 1px solid rgba(255,255,255,0.3);
+                color: white;
+                padding: 8px 16px;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 14px;
+            }}
+            
+            .nav-btn {{
+                background: #1abc9c;
+                border: none;
+                color: white;
+                width: 40px;
+                height: 40px;
+                border-radius: 50%;
+                cursor: pointer;
+                font-size: 18px;
+            }}
+            
+            /* 阅读器主体 */
+            .reader-main {{
+                flex: 1;
+                display: flex;
+                position: relative;
+            }}
+            
+            #viewer {{
+                flex: 1;
+                background: white;
+                margin: 0;
+            }}
+            
+            /* 加载状态 */
+            .loading-container {{
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(44, 62, 80, 0.95);
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                z-index: 1000;
+            }}
+            
+            .loading-spinner {{
+                width: 50px;
+                height: 50px;
+                border: 5px solid rgba(255,255,255,0.3);
+                border-top: 5px solid #1abc9c;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+                margin-bottom: 20px;
+            }}
+            
+            @keyframes spin {{
+                0% {{ transform: rotate(0deg); }}
+                100% {{ transform: rotate(360deg); }}
+            }}
+            
+            .loading-text {{
+                color: white;
+                font-size: 16px;
+                text-align: center;
+            }}
+            
+            /* 错误状态 */
+            .error-container {{
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(231, 76, 60, 0.95);
+                display: none;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                z-index: 1000;
+                padding: 20px;
+                text-align: center;
+            }}
+            
+            .network-status {{
+                position: fixed;
+                top: 10px;
+                right: 10px;
+                background: rgba(0,0,0,0.7);
+                color: white;
+                padding: 5px 10px;
+                border-radius: 5px;
+                font-size: 12px;
+                z-index: 1001;
+            }}
+
+            /* 加载策略指示器 */
+            .load-strategy {{
+                position: fixed;
+                top: 10px;
+                left: 10px;
+                background: rgba(0,0,0,0.7);
+                color: white;
+                padding: 5px 10px;
+                border-radius: 5px;
+                font-size: 12px;
+                z-index: 1001;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="network-status" id="network-status">检测中...</div>
+        <div class="load-strategy" id="load-strategy">加载策略: 先本地后网络</div>
+        
+        <div class="reader-container">
+            <div class="reader-header">
+                <div class="reader-title" id="book-title">📖 {filename}</div>
+                <div class="reader-controls">
+                    <button class="nav-btn" id="prev-btn">‹</button>
+                    <div id="progress-info">就绪</div>
+                    <button class="nav-btn" id="next-btn">›</button>
+                    <button class="control-btn" onclick="downloadEpub()">下载</button>
+                    <button class="control-btn" onclick="window.close()">关闭</button>
+                </div>
+            </div>
+            
+            <div class="reader-main">
+                <div id="viewer"></div>
+                
+                <div class="loading-container" id="loading-container">
+                    <div class="loading-spinner"></div>
+                    <div class="loading-text" id="loading-text">正在初始化阅读器...</div>
+                    <div class="loading-text" id="load-details" style="font-size: 12px; margin-top: 10px;"></div>
+                </div>
+                
+                <div class="error-container" id="error-container">
+                    <div style="font-size: 48px; margin-bottom: 20px;">❌</div>
+                    <h3>加载失败</h3>
+                    <p id="error-message">未知错误</p>
+                    <div style="margin-top: 20px;">
+                        <button class="control-btn" onclick="retryLoading()">重试</button>
+                        <button class="control-btn" onclick="downloadEpub()">下载文件</button>
+                        <button class="control-btn" onclick="window.close()">关闭</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            let book = null;
+            let rendition = null;
+            let loadStrategy = '先本地后网络';
+            
+            // 更新网络状态
+            function updateNetworkStatus() {{
+                const statusElem = document.getElementById('network-status');
+                if (navigator.onLine) {{
+                    statusElem.innerHTML = '🌐 在线';
+                    statusElem.style.background = 'rgba(46, 204, 113, 0.8)';
+                }} else {{
+                    statusElem.innerHTML = '📴 离线';
+                    statusElem.style.background = 'rgba(231, 76, 60, 0.8)';
+                }}
+            }}
+            
+            // 显示/隐藏加载状态
+            function showLoading(message, details = '') {{
+                document.getElementById('loading-text').textContent = message;
+                document.getElementById('load-details').textContent = details;
+                document.getElementById('loading-container').style.display = 'flex';
+                document.getElementById('error-container').style.display = 'none';
+            }}
+            
+            function hideLoading() {{
+                document.getElementById('loading-container').style.display = 'none';
+            }}
+            
+            function showError(message) {{
+                document.getElementById('error-message').textContent = message;
+                document.getElementById('error-container').style.display = 'flex';
+                document.getElementById('loading-container').style.display = 'none';
+            }}
+            
+            // 初始化EPUB阅读器
+            async function initializeReader() {{
+                try {{
+                    showLoading('正在加载必要的库...', '策略: ' + loadStrategy);
+                    updateNetworkStatus();
+                    
+                    // 使用智能加载器加载库 - 先本地后网络
+                    const loadSuccess = await window.libraryLoader.loadAll();
+                    
+                    if (!loadSuccess) {{
+                        throw new Error('无法加载必要的JavaScript库。请检查网络连接或联系管理员。');
+                    }}
+                    
+                    showLoading('正在加载电子书...', '从服务器获取EPUB文件');
+                    
+                    // 创建EPUB实例
+                    book = ePub('/api/document?path={encoded_path}');
+                    
+                    // 等待书籍准备就绪
+                    await book.ready;
+                    
+                    // 渲染到视图
+                    rendition = book.renderTo('viewer', {{
+                        width: '100%',
+                        height: '100%',
+                        spread: 'auto'
+                    }});
+                    
+                    // 显示内容
+                    await rendition.display();
+                    
+                    // 设置事件
+                    rendition.on('relocated', updateProgress);
+                    document.getElementById('prev-btn').onclick = () => rendition.prev();
+                    document.getElementById('next-btn').onclick = () => rendition.next();
+                    
+                    // 键盘控制
+                    document.onkeydown = (e) => {{
+                        if (e.key === 'ArrowLeft') rendition.prev();
+                        if (e.key === 'ArrowRight') rendition.next();
+                        if (e.key === 'Escape') window.close();
+                    }};
+                    
+                    // 更新标题
+                    if (book.package.metadata.title) {{
+                        document.getElementById('book-title').textContent = 
+                            `📖 ${{book.package.metadata.title}}`;
+                    }}
+                    
+                    hideLoading();
+                    console.log('EPUB阅读器初始化成功');
+                    
+                }} catch (error) {{
+                    console.error('初始化失败:', error);
+                    showError('初始化失败: ' + error.message);
+                }}
+            }}
+            
+            // 更新阅读进度
+            function updateProgress(location) {{
+                if (book && location) {{
+                    try {{
+                        const current = location.start.displayed.page;
+                        const total = book.spine.length;
+                        const percent = Math.round((current / total) * 100);
+                        document.getElementById('progress-info').textContent = 
+                            `${{current}}/${{total}} (${{percent}}%)`;
+                    }} catch (e) {{
+                        document.getElementById('progress-info').textContent = '阅读中...';
+                    }}
+                }}
+            }}
+            
+            // 下载功能
+            function downloadEpub() {{
+                const link = document.createElement('a');
+                link.href = '/api/document?path={encoded_path}';
+                link.download = '{filename}';
+                link.click();
+            }}
+            
+            // 重试加载
+            function retryLoading() {{
+                document.getElementById('error-container').style.display = 'none';
+                initializeReader();
+            }}
+            
+            // 网络状态监听
+            window.addEventListener('online', updateNetworkStatus);
+            window.addEventListener('offline', updateNetworkStatus);
+            
+            // 页面加载完成后初始化
+            window.addEventListener('load', () => {{
+                setTimeout(initializeReader, 100);
+            }});
+        </script>
+    </body>
+    </html>
+    '''
+    
+    def handle_epub_fallback(self, epub_path):
+        """EPUB阅读器失败时的回退方案"""
+        try:
+            # 读取EPUB文件内容用于显示基本信息
+            file_size = os.path.getsize(epub_path)
+            filename = os.path.basename(epub_path)
+            
+            html_content = f'''
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>EPUB阅读器 - {filename}</title>
+        <style>
+            body {{
+                font-family: 'Microsoft YaHei', Arial, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                margin: 0;
+                padding: 20px;
+                min-height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }}
+            .fallback-container {{
+                background: white;
+                padding: 40px;
+                border-radius: 15px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+                text-align: center;
+                max-width: 500px;
+            }}
+            .epub-icon {{
+                font-size: 80px;
+                margin-bottom: 20px;
+            }}
+            .download-btn {{
+                background: #4CAF50;
+                color: white;
+                border: none;
+                padding: 15px 30px;
+                border-radius: 25px;
+                font-size: 16px;
+                cursor: pointer;
+                margin: 20px 0;
+                transition: all 0.3s;
+            }}
+            .download-btn:hover {{
+                background: #45a049;
+                transform: translateY(-2px);
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="fallback-container">
+            <div class="epub-icon">📚</div>
+            <h2>{filename}</h2>
+            <p>文件大小: {self.format_file_size(file_size)}</p>
+            <p>在线阅读器暂时不可用，请下载后使用专业阅读器打开</p>
+            <button class="download-btn" onclick="downloadEpub()">📥 下载EPUB文件</button>
+            <p><small>推荐使用 Calibre、Adobe Digital Editions 或手机端的静读天下等阅读器</small></p>
+        </div>
+
+        <script>
+            function downloadEpub() {{
+                const link = document.createElement('a');
+                link.href = '/api/document?path={urllib.parse.quote(epub_path)}';
+                link.download = '{filename}';
+                link.click();
+            }}
+        </script>
+    </body>
+    </html>
+    '''
+            
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(html_content.encode('utf-8'))))
+            self.end_headers()
+            self.wfile.write(html_content.encode('utf-8'))
+            
+        except Exception as e:
+            print(f"[SERVER ERROR] 回退方案也失败了: {e}")
+            # 最后的手段 - 直接下载
+            self.send_document_file(epub_path)
+
+    def format_file_size(self, size):
+        """格式化文件大小"""
+        if size < 1024:
+            return f"{size} B"
+        elif size < 1024 * 1024:
+            return f"{size / 1024:.2f} KB"
+        elif size < 1024 * 1024 * 1024:
+            return f"{size / (1024 * 1024):.2f} MB"
+        else:
+            return f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+    def send_document_file(self, doc_path):
+        """发送文档文件"""
+        try:
+            file_size = os.path.getsize(doc_path)
+            filename = os.path.basename(doc_path)
+            
+            # 确定MIME类型
+            ext = os.path.splitext(doc_path)[1].lower()
+            mime_types = {
+                '.pdf': 'application/pdf',
+                '.txt': 'text/plain',
+                '.doc': 'application/msword',
+                '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                '.ppt': 'application/vnd.ms-powerpoint',
+                '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                '.xls': 'application/vnd.ms-excel',
+                '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                '.rtf': 'application/rtf',
+                '.odt': 'application/vnd.oasis.opendocument.text',
+                '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
+                '.odp': 'application/vnd.oasis.opendocument.presentation',
+                '.pages': 'application/vnd.apple.pages',
+                '.numbers': 'application/vnd.apple.numbers',
+                '.key': 'application/vnd.apple.keynote',
+                '.epub': 'application/epub+zip',
+                '.mobi': 'application/x-mobipocket-ebook',
+                '.azw': 'application/vnd.amazon.ebook',
+                '.azw3': 'application/vnd.amazon.ebook',
+                '.fb2': 'application/x-fictionbook',
+                '.lit': 'application/x-ms-reader',
+                '.prc': 'application/x-mobipocket-ebook',
+                '.pdb': 'application/vnd.palm',
+                '.chm': 'application/vnd.ms-htmlhelp',
+                '.djvu': 'image/vnd.djvu',
+                '.djv': 'image/vnd.djvu'
+            }
+            content_type = mime_types.get(ext, 'application/octet-stream')
+            
+            # 安全编码文件名
+            try:
+                safe_filename = filename.encode('utf-8').decode('latin-1')
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                safe_filename = "document" + ext
+            
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(file_size))
+            self.send_header('Content-Disposition', f'inline; filename="{safe_filename}"')
+            self.end_headers()
+            
+            # 发送文件内容
+            with open(doc_path, 'rb') as f:
+                while chunk := f.read(8192):
+                    try:
+                        self.wfile.write(chunk)
+                    except ConnectionResetError:
+                        print(f"[INFO] 文档传输中断: {doc_path}")
+                        return
+                        
+        except Exception as e:
+            print(f"[SERVER ERROR] 发送文档文件失败: {e}")
+            self.send_safe_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+    def do_POST(self):
+        """处理POST请求"""
+        try:
+            parsed_path = urllib.parse.urlparse(self.path)
+            path = parsed_path.path
+            
+            if path == '/api/scan':
+                self.handle_scan_request()
+            elif path == '/api/open':
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length).decode('utf-8')
+                data = json.loads(post_data)
+                self.handle_open_post(data)
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND, "API endpoint not found")
+                
+        except Exception as e:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+
+    def get_index_html(self):
+        """返回主页面HTML - 增强版，支持PDF、视频、文档播放和优化界面"""
+        return '''
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>''' + ProjectInfo.NAME + ''' - Web客户端</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Microsoft YaHei', Arial, sans-serif;
+                background: linear-gradient(135deg, #F4A8B0 0%, #DFAC85 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+            
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+                background: rgba(255, 255, 255, 0.95);
+                border-radius: 15px;
+                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+                overflow: hidden;
+            }
+            
+            .header {
+                background: linear-gradient(135deg, #9DB0DA, #ACBADD);
+                color: white;
+                padding: 20px;
+                text-align: center;
+            }
+            
+            .header h1 {
+                font-size: 2.2em;
+                margin-bottom: 5px;
+            }
+            
+            .header .subtitle {
+                font-size: 1.1em;
+                opacity: 0.9;
+            }
+            
+            .controls {
+                padding: 20px;
+                background: white;
+                border-bottom: 1px solid #eee;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 15px;
+                align-items: center;
+            }
+            
+            .search-box {
+                flex: 1;
+                min-width: 300px;
+                position: relative;
+            }
+            
+            .search-box input {
+                width: 100%;
+                padding: 12px 20px;
+                border: 2px solid #C7CCE5;
+                border-radius: 25px;
+                font-size: 16px;
+                outline: none;
+                transition: all 0.3s;
+            }
+            
+            .search-box input:focus {
+                border-color: #9DB0DA;
+                box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            }
+            
+            .buttons {
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+            }
+            
+            .btn {
+                padding: 12px 20px;
+                border: none;
+                border-radius: 25px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: bold;
+                transition: all 0.3s;
+                text-decoration: none;
+                display: inline-block;
+                text-align: center;
+            }
+            
+            .btn-primary {
+                background: #9DB0DA;
+                color: white;
+            }
+            
+            .btn-success {
+                background: #B1C16B;
+                color: white;
+            }
+            
+            .btn-warning {
+                background: #E79A76;
+                color: white;
+            }
+            
+            .btn-info {
+                background: #6DA9E4;
+                color: white;
+            }
+            
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+            }
+            
+            .status-bar {
+                padding: 10px 20px;
+                background: #CCC4B1;
+                border-bottom: 1px solid #ddd;
+                font-size: 14px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+            
+            .view-controls {
+                padding: 10px 20px;
+                background: #f8f9fa;
+                border-bottom: 1px solid #eee;
+                display: flex;
+                gap: 10px;
+                align-items: center;
+            }
+            
+            .view-btn {
+                padding: 8px 16px;
+                border: 1px solid #ddd;
+                background: white;
+                border-radius: 5px;
+                cursor: pointer;
+                transition: all 0.3s;
+            }
+            
+            .view-btn.active {
+                background: #9DB0DA;
+                color: white;
+                border-color: #9DB0DA;
+            }
+            
+            .directories-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+                gap: 20px;
+                padding: 20px;
+            }
+            
+            .directories-list {
+                display: block;
+                padding: 10px;
+            }
+            
+            .directory-card {
+                background: white;
+                border-radius: 10px;
+                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+                overflow: hidden;
+                transition: all 0.3s;
+                border: 1px solid #eee;
+            }
+            
+            .directory-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
+            }
+            
+            .directory-list-item {
+                display: flex;
+                align-items: center;
+                padding: 15px;
+                border-bottom: 1px solid #eee;
+                background: white;
+                transition: all 0.3s;
+            }
+            
+            .directory-list-item:hover {
+                background: #f8f9fa;
+            }
+            
+            .cover-image {
+                width: 100%;
+                height: 200px;
+                object-fit: cover;
+                background: #C6C2B2;
+                cursor: pointer;
+            }
+            
+            .list-cover {
+                width: 80px;
+                height: 60px;
+                object-fit: cover;
+                margin-right: 15px;
+                border-radius: 5px;
+            }
+            
+            .video-indicator {
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                background: rgba(0, 0, 0, 0.7);
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            
+            .pdf-indicator {
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                background: rgba(255, 87, 34, 0.9);
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            
+            .document-indicator {
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                background: rgba(76, 175, 80, 0.9);
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            
+            .card-content {
+                padding: 15px;
+            }
+            
+            .list-content {
+                flex: 1;
+            }
+            
+            .directory-name {
+                font-size: 1.2em;
+                font-weight: bold;
+                margin-bottom: 8px;
+                color: #333;
+            }
+            
+            .directory-path {
+                font-size: 0.9em;
+                color: #666;
+                margin-bottom: 10px;
+                word-break: break-all;
+            }
+            
+            .directory-info {
+                display: flex;
+                justify-content: space-between;
+                font-size: 0.8em;
+                color: #888;
+                margin-bottom: 10px;
+            }
+            
+            .list-info {
+                display: flex;
+                gap: 15px;
+                font-size: 0.8em;
+                color: #888;
+            }
+            
+            .card-actions {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            
+            .list-actions {
+                display: flex;
+                gap: 8px;
+            }
+            
+            .btn-small {
+                padding: 6px 12px;
+                font-size: 12px;
+                border-radius: 15px;
+            }
+            
+            .status-online {
+                color: #4CAF50;
+                font-weight: bold;
+            }
+            
+            .status-offline {
+                color: #FF9800;
+                font-weight: bold;
+            }
+            
+            .loading {
+                text-align: center;
+                padding: 40px;
+                color: #666;
+                grid-column: 1 / -1;
+            }
+            
+            .no-results {
+                text-align: center;
+                padding: 40px;
+                color: #999;
+                grid-column: 1 / -1;
+            }
+            
+            .modal {
+                display: none;
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.9);
+                z-index: 1000;
+                align-items: center;
+                justify-content: center;
+            }
+            
+            .modal-content {
+                background: white;
+                border-radius: 10px;
+                max-width: 95%;
+                max-height: 95%;
+                overflow: auto;
+                position: relative;
+            }
+            
+            .modal-image {
+                max-width: 100%;
+                max-height: 95vh;
+                display: block;
+                margin: 0 auto;
+            }
+            
+            .modal-video {
+                width: 90%;
+                height: auto;
+                max-height: 90vh;
+            }
+            
+            .modal-pdf {
+                width: 100%;
+                height: 100%;
+                border: none;
+                border-radius: 10px;
+                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            }
+            
+            .close-modal {
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                background: rgba(0, 0, 0, 0.7);
+                color: white;
+                border: none;
+                border-radius: 50%;
+                width: 30px;
+                height: 30px;
+                cursor: pointer;
+                z-index: 1001;
+            }
+            
+            .media-controls {
+                position: absolute;
+                bottom: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                display: none !important;
+                gap: 10px;
+                background: rgba(0, 0, 0, 0.7);
+                padding: 10px;
+                border-radius: 5px;
+                visibility: hidden !important;
+                opacity: 0 !important;
+                pointer-events: none !important;
+            }
+            
+            .pdf-controls {
+                position: absolute;
+                bottom: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                display: flex;
+                gap: 10px;
+                background: rgba(0, 0, 0, 0.8);
+                padding: 10px 15px;
+                border-radius: 25px;
+                z-index: 1002;
+            }
+            
+            .media-btn {
+                background: none;
+                border: none;
+                color: white;
+                cursor: pointer;
+                padding: 5px 10px;
+                display: none !important;
+                visibility: hidden !important;
+                opacity: 0 !important;
+            }
+
+            .pdf-btn {
+                background: none;
+                border: none;
+                color: white;
+                cursor: pointer;
+                padding: 8px 12px;
+                border-radius: 5px;
+                transition: background-color 0.3s;
+            }
+            
+            .pdf-btn:hover {
+                background: rgba(255, 255, 255, 0.2);
+            }
+            
+            .pdf-page-info {
+                color: white;
+                padding: 8px 12px;
+                font-size: 14px;
+            }
+            
+            .file-type-badge {
+                position: absolute;
+                top: 10px;
+                left: 10px;
+                background: rgba(0, 0, 0, 0.7);
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            
+            .filter-controls {
+                display: flex;
+                gap: 10px;
+                align-items: center;
+                margin-left: auto;
+            }
+            
+            .filter-select {
+                padding: 8px 12px;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                background: white;
+            }
+            
+            .file-size {
+                font-size: 0.8em;
+                color: #888;
+                margin-top: 5px;
+            }
+
+            /* PDF模态框专用样式 */
+            .pdf-modal-container {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.95);
+                z-index: 2000;
+                display: none;
+                flex-direction: column;
+            }
+
+            .pdf-modal-header {
+                background: rgba(255, 255, 255, 0.1);
+                padding: 15px 20px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                color: white;
+            }
+
+            .pdf-modal-title {
+                font-size: 18px;
+                font-weight: bold;
+            }
+
+            .pdf-modal-close {
+                background: rgba(255, 255, 255, 0.2);
+                border: none;
+                color: white;
+                width: 40px;
+                height: 40px;
+                border-radius: 50%;
+                cursor: pointer;
+                font-size: 20px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .pdf-modal-close:hover {
+                background: rgba(255, 255, 255, 0.3);
+            }
+
+            .pdf-modal-content {
+                flex: 1;
+                display: flex;
+                padding: 20px;
+            }
+
+            .pdf-viewer-container {
+                flex: 1;
+                background: white;
+                border-radius: 10px;
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .pdf-viewer-iframe {
+                flex: 1;
+                border: none;
+                width: 100%;
+                height: 100%;
+            }
+
+            .pdf-toolbar {
+                background: #f8f9fa;
+                padding: 15px 20px;
+                display: flex;
+                align-items: center;
+                gap: 15px;
+                border-bottom: 1px solid #dee2e6;
+            }
+
+            .pdf-toolbar-btn {
+                padding: 8px 16px;
+                border: 1px solid #6c757d;
+                background: white;
+                border-radius: 5px;
+                cursor: pointer;
+                transition: all 0.3s;
+                color: #6c757d;
+            }
+
+            .pdf-toolbar-btn:hover {
+                background: #6c757d;
+                color: white;
+            }
+
+            .pdf-toolbar-info {
+                margin-left: auto;
+                color: #6c757d;
+                font-size: 14px;
+            }
+
+            /* 文档模态框样式 */
+            .document-modal-container {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.95);
+                z-index: 2000;
+                display: none;
+                flex-direction: column;
+            }
+
+            .document-modal-header {
+                background: rgba(255, 255, 255, 0.1);
+                padding: 15px 20px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                color: white;
+            }
+
+            .document-modal-title {
+                font-size: 18px;
+                font-weight: bold;
+            }
+
+            .document-modal-close {
+                background: rgba(255, 255, 255, 0.2);
+                border: none;
+                color: white;
+                width: 40px;
+                height: 40px;
+                border-radius: 50%;
+                cursor: pointer;
+                font-size: 20px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .document-modal-close:hover {
+                background: rgba(255, 255, 255, 0.3);
+            }
+
+            .document-modal-content {
+                flex: 1;
+                display: flex;
+                padding: 20px;
+            }
+
+            .document-viewer-container {
+                flex: 1;
+                background: white;
+                border-radius: 10px;
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .document-viewer-iframe {
+                flex: 1;
+                border: none;
+                width: 100%;
+                height: 100%;
+            }
+
+            .document-toolbar {
+                background: #f8f9fa;
+                padding: 15px 20px;
+                display: flex;
+                align-items: center;
+                gap: 15px;
+                border-bottom: 1px solid #dee2e6;
+            }
+
+            .document-toolbar-btn {
+                padding: 8px 16px;
+                border: 1px solid #6c757d;
+                background: white;
+                border-radius: 5px;
+                cursor: pointer;
+                transition: all 0.3s;
+                color: #6c757d;
+            }
+
+            .document-toolbar-btn:hover {
+                background: #6c757d;
+                color: white;
+            }
+
+            .document-toolbar-info {
+                margin-left: auto;
+                color: #6c757d;
+                font-size: 14px;
+            }
+
+            @media (max-width: 768px) {
+                .directories-grid {
+                    grid-template-columns: 1fr;
+                }
+                
+                .controls {
+                    flex-direction: column;
+                    align-items: stretch;
+                }
+                
+                .search-box {
+                    min-width: auto;
+                }
+                
+                .buttons {
+                    justify-content: center;
+                }
+                
+                .card-actions, .list-actions {
+                    justify-content: center;
+                }
+                
+                .status-bar {
+                    flex-direction: column;
+                    gap: 10px;
+                    text-align: center;
+                }
+                
+                .modal-video {
+                    width: 95%;
+                }
+                
+                .pdf-modal-content {
+                    padding: 10px;
+                }
+                
+                .pdf-toolbar {
+                    flex-wrap: wrap;
+                    justify-content: center;
+                }
+                
+                .pdf-toolbar-info {
+                    margin-left: 0;
+                    width: 100%;
+                    text-align: center;
+                    margin-top: 10px;
+                }
+                
+                .document-modal-content {
+                    padding: 10px;
+                }
+                
+                .document-toolbar {
+                    flex-wrap: wrap;
+                    justify-content: center;
+                }
+                
+                .document-toolbar-info {
+                    margin-left: 0;
+                    width: 100%;
+                    text-align: center;
+                    margin-top: 10px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>📁 ''' + ProjectInfo.NAME + '''</h1>
+                <div class="subtitle">版本 ''' + ProjectInfo.VERSION + ''' | Web客户端</div>
+            </div>
+            
+            <div class="controls">
+                <div class="search-box">
+                    <input type="text" id="searchInput" placeholder="搜索目录名称或路径...支持拼音首字母搜索" onkeypress="handleSearchKeyPress(event)">
+                </div>
+                <div class="buttons">
+                    <button class="btn btn-primary" onclick="loadDirectories()">🔄 刷新</button>
+                    <button class="btn btn-success" onclick="startScan()">🔍 扫描目录</button>
+                    <button class="btn btn-warning" onclick="showSystemInfo()">ℹ️ 系统信息</button>
+                    <button class="btn btn-info" onclick="toggleViewMode()">📋 列表视图</button>
+                </div>
+            </div>
+            
+            <div class="view-controls">
+                <div class="filter-controls">
+                    <select id="typeFilter" class="filter-select" onchange="filterByType()">
+                        <option value="all">所有类型</option>
+                        <option value="directory">仅目录</option>
+                        <option value="file">仅文件</option>
+                        <option value="video">视频文件</option>
+                        <option value="image">图片文件</option>
+                        <option value="pdf">PDF文件</option>
+                        <option value="document">文档文件</option>
+                    </select>
+                    <select id="sortSelect" class="filter-select" onchange="sortDirectories()">
+                        <option value="name">按名称排序</option>
+                        <option value="date">按日期排序</option>
+                        <option value="size">按大小排序</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="status-bar">
+                <div id="statusInfo">正在加载...</div>
+                <div id="itemCount">-</div>
+            </div>
+            
+            <div id="directoriesContainer" class="directories-grid">
+                <div class="loading">正在加载目录数据...</div>
+            </div>
+        </div>
+        
+        <!-- 图片/视频预览模态框 -->
+        <div id="mediaModal" class="modal" onclick="closeMediaModal()">
+            <div class="modal-content">
+                <button class="close-modal" onclick="closeMediaModal()">×</button>
+                <img id="modalImage" class="modal-image" src="" onclick="event.stopPropagation()" style="display: none;">
+                <video id="modalVideo" class="modal-video" controls autoplay onclick="event.stopPropagation()" style="display: none;">
+                    您的浏览器不支持视频播放
+                </video>
+                <div class="media-controls" style="display: none;">
+                    <button class="media-btn" onclick="playPauseVideo()">⏯️</button>
+                    <button class="media-btn" onclick="muteUnmuteVideo()">🔇</button>
+                    <button class="media-btn" onclick="fullscreenVideo()">⛶</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- PDF预览模态框 -->
+        <div id="pdfModal" class="pdf-modal-container">
+            <div class="pdf-modal-header">
+                <div class="pdf-modal-title" id="pdfModalTitle">PDF预览</div>
+                <button class="pdf-modal-close" onclick="closePdfModal()">×</button>
+            </div>
+            <div class="pdf-modal-content">
+                <div class="pdf-viewer-container">
+                    <div class="pdf-toolbar">
+                        <button class="pdf-toolbar-btn" onclick="downloadPdf()">📥 下载PDF</button>
+                        <button class="pdf-toolbar-btn" onclick="printPdf()">🖨️ 打印</button>
+                        <button class="pdf-toolbar-btn" onclick="zoomInPdf()">🔍 放大</button>
+                        <button class="pdf-toolbar-btn" onclick="zoomOutPdf()">🔍 缩小</button>
+                        <button class="pdf-toolbar-btn" onclick="fitToWidthPdf()">📏 适合宽度</button>
+                        <button class="pdf-toolbar-btn" onclick="fitToPagePdf()">📄 适合页面</button>
+                        <div class="pdf-toolbar-info" id="pdfToolbarInfo">就绪</div>
+                    </div>
+                    <iframe id="modalPdf" class="pdf-viewer-iframe" src=""></iframe>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 文档预览模态框 -->
+        <div id="documentModal" class="document-modal-container">
+            <div class="document-modal-header">
+                <div class="document-modal-title" id="documentModalTitle">文档预览</div>
+                <button class="document-modal-close" onclick="closeDocumentModal()">×</button>
+            </div>
+            <div class="document-modal-content">
+                <div class="document-viewer-container">
+                    <div class="document-toolbar">
+                        <button class="document-toolbar-btn" onclick="downloadDocument()">📥 下载文档</button>
+                        <button class="document-toolbar-btn" onclick="printDocument()">🖨️ 打印</button>
+                        <button class="document-toolbar-btn" onclick="zoomInDocument()">🔍 放大</button>
+                        <button class="document-toolbar-btn" onclick="zoomOutDocument()">🔍 缩小</button>
+                        <div class="document-toolbar-info" id="documentToolbarInfo">就绪</div>
+                    </div>
+                    <iframe id="modalDocument" class="document-viewer-iframe" src=""></iframe>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            let currentData = [];
+            let currentViewMode = 'grid';
+            let currentTypeFilter = 'all';
+            let currentSort = 'name';
+            let currentPdfZoom = 1.0;
+            let currentDocumentZoom = 1.0;
+            
+            // 页面加载完成后初始化
+            document.addEventListener('DOMContentLoaded', function() {
+                loadDirectories();
+                updateSystemStatus();
+                setInterval(updateSystemStatus, 30000);
+            });
+            
+            // 加载目录数据
+            async function loadDirectories(searchTerm = '') {
+                try {
+                    showLoading();
+                    const url = searchTerm ? '/api/directories/search?q=' + encodeURIComponent(searchTerm) : '/api/directories';
+                    const response = await fetch(url);
+                    const data = await response.json();
+                    
+                    currentData = data.directories || [];
+                    applyFiltersAndSort();
+                    updateItemCount(currentData.length);
+                    updateStatus('数据加载成功');
+                    
+                } catch (error) {
+                    console.error('加载目录失败:', error);
+                    updateStatus('加载失败: ' + error.message, 'error');
+                    showError('无法加载目录数据');
+                }
+            }
+            
+            // 应用过滤和排序
+            function applyFiltersAndSort() {
+                let filteredData = [...currentData];
+                
+                if (currentTypeFilter !== 'all') {
+                    filteredData = filteredData.filter(item => {
+                        if (currentTypeFilter === 'directory') return item.is_directory;
+                        if (currentTypeFilter === 'file') return !item.is_directory;
+                        if (currentTypeFilter === 'video') return isVideoFile(item.name);
+                        if (currentTypeFilter === 'image') return isImageFile(item.name);
+                        if (currentTypeFilter === 'pdf') return isPdfFile(item.name);
+                        if (currentTypeFilter === 'document') return isDocumentFile(item.name);
+                        return true;
+                    });
+                }
+                
+                filteredData.sort((a, b) => {
+                    switch (currentSort) {
+                        case 'name':
+                            return a.name.localeCompare(b.name);
+                        case 'date':
+                            return new Date(b.last_modified) - new Date(a.last_modified);
+                        case 'size':
+                            return 0;
+                        default:
+                            return 0;
+                    }
+                });
+                
+                displayDirectories(filteredData);
+            }
+            
+            // 类型过滤
+            function filterByType() {
+                currentTypeFilter = document.getElementById('typeFilter').value;
+                applyFiltersAndSort();
+            }
+            
+            // 排序
+            function sortDirectories() {
+                currentSort = document.getElementById('sortSelect').value;
+                applyFiltersAndSort();
+            }
+            
+            // 切换视图模式
+            function toggleViewMode() {
+                currentViewMode = currentViewMode === 'grid' ? 'list' : 'grid';
+                const btn = document.querySelector('.btn-info');
+                btn.textContent = currentViewMode === 'grid' ? '📋 列表视图' : '🔲 网格视图';
+                applyFiltersAndSort();
+            }
+            
+            // 显示目录列表
+            function displayDirectories(directories) {
+                const container = document.getElementById('directoriesContainer');
+                container.className = currentViewMode === 'grid' ? 'directories-grid' : 'directories-list';
+                
+                if (directories.length === 0) {
+                    container.innerHTML = '<div class="no-results">📭 没有找到匹配的目录</div>';
+                    return;
+                }
+                
+                let html = '';
+                
+                directories.forEach(dir => {
+                    const encodedPath = encodeURIComponent(dir.path);
+                    const isVideo = isVideoFile(dir.name);
+                    const isImage = isImageFile(dir.name);
+                    const isPdf = isPdfFile(dir.name);
+                    const isDocument = isDocumentFile(dir.name);
+                    const fileType = !dir.is_directory ? (
+                        isVideo ? 'video' : 
+                        isImage ? 'image' : 
+                        isPdf ? 'pdf' :
+                        isDocument ? 'document' : 'file'
+                    ) : 'directory';
+                    
+                    if (currentViewMode === 'grid') {
+                        html += `
+                            <div class="directory-card" data-type="${fileType}">
+                                <div style="position: relative;">
+                                    ${!dir.is_directory ? `<div class="file-type-badge">${getFileTypeBadge(dir.name)}</div>` : ''}
+                                    <img class="cover-image" 
+                                        src="/api/cover?path=${encodedPath}" 
+                                        alt="${dir.name}"
+                                        onclick="showMedia('${encodedPath}', '${fileType}')"
+                                        onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgZmlsbD0iI2Y4ZjlmYSIvPjx0ZXh0IHg9IjEwMCIgeT0iMTAwIiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM2Yzc1N2QiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIwLjM1ZW0iPuiNieeUqOaAp+aEn+WbvueJhzwvdGV4dD48L3N2Zz4='">
+                                    ${isVideo ? '<div class="video-indicator">🎬 视频</div>' : ''}
+                                    ${isPdf ? '<div class="pdf-indicator">📄 PDF</div>' : ''}
+                                    ${isDocument ? '<div class="document-indicator">📝 文档</div>' : ''}
+                                </div>
+                                <div class="card-content">
+                                    <div class="directory-name">${dir.name}</div>
+                                    <div class="directory-path" title="${dir.path}">${dir.path}</div>
+                                    <div class="directory-info">
+                                        <span>修改: ${formatDate(dir.last_modified)}</span>
+                                        <span>ID: ${dir.id}</span>
+                                        <span class="${dir.exists ? 'status-online' : 'status-offline'}">
+                                            ${dir.exists ? '✅ 上架' : '❌ 下架'}
+                                        </span>
+                                    </div>
+                                    <div class="card-actions">
+                                        <button class="btn btn-primary btn-small" onclick="openDirectory('${dir.path}', ${dir.id})">📂 打开</button>
+                                        <button class="btn btn-success btn-small" onclick="showMedia('${encodedPath}', '${fileType}')">
+                                            ${isVideo ? '🎬 播放' : isImage ? '🖼️ 查看' : isPdf ? '📄 查看PDF' : isDocument ? '📝 查看文档' : '📄 查看'}
+                                        </button>
+                                        <button class="btn btn-info btn-small" onclick="showDatabaseInfo(${dir.id})">ℹ️ 信息</button>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        html += `
+                            <div class="directory-list-item" data-type="${fileType}">
+                                <img class="list-cover" 
+                                    src="/api/cover?path=${encodedPath}" 
+                                    alt="${dir.name}"
+                                    onclick="showMedia('${encodedPath}', '${fileType}')"
+                                    onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iNjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjgwIiBoZWlnaHQ9IjYwIiBmaWxsPSIjZjhmOWZhIi8+PHRleHQgeD0iNDAiIHk9IjMwIiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMTIiIGZpbGw9IiM2Yzc1N2QiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIwLjNlbSI+5Y2V5L2N5Zu+54mHPC90ZXh0Pjwvc3ZnPg==='">
+                                <div class="list-content">
+                                    <div class="directory-name">${dir.name} ${isVideo ? '🎬' : isImage ? '🖼️' : isPdf ? '📄' : isDocument ? '📝' : ''}</div>
+                                    <div class="directory-path" title="${dir.path}">${dir.path}</div>
+                                    <div class="list-info">
+                                        <span>修改: ${formatDate(dir.last_modified)}</span>
+                                        <span>ID: ${dir.id}</span>
+                                        <span class="${dir.exists ? 'status-online' : 'status-offline'}">
+                                            ${dir.exists ? '✅ 上架' : '❌ 下架'}
+                                        </span>
+                                    </div>
+                                </div>
+                                <div class="list-actions">
+                                    <button class="btn btn-primary btn-small" onclick="openDirectory('${dir.path}', ${dir.id})">打开</button>
+                                    <button class="btn btn-success btn-small" onclick="showMedia('${encodedPath}', '${fileType}')">
+                                        ${isVideo ? '播放' : isImage ? '查看' : isPdf ? '查看PDF' : isDocument ? '查看文档' : '查看'}
+                                    </button>
+                                    <button class="btn btn-info btn-small" onclick="showDatabaseInfo(${dir.id})">信息</button>
+                                </div>
+                            </div>
+                        `;
+                    }
+                });
+                
+                container.innerHTML = html;
+            }
+            
+            // 文件类型检测
+            function isPdfFile(filename) {
+                return filename.toLowerCase().endsWith('.pdf');
+            }
+
+            function isDocumentFile(filename) {
+                const documentExtensions = [
+                    '.pdf', '.txt', '.doc', '.docx', '.ppt', '.pptx', '.xls', 
+                    '.xlsx', '.rtf', '.odt', '.ods', '.odp', '.pages', '.numbers',
+                    '.key', '.epub', '.mobi', '.azw', '.azw3', '.fb2', '.lit',
+                    '.prc', '.pdb', '.chm', '.djvu', '.djv'
+                ];
+                return documentExtensions.some(ext => filename.toLowerCase().endsWith(ext));
+            }
+            
+            function isVideoFile(filename) {
+                const videoExtensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v'];
+                return videoExtensions.some(ext => filename.toLowerCase().endsWith(ext));
+            }
+            
+            function isImageFile(filename) {
+                const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
+                return imageExtensions.some(ext => filename.toLowerCase().endsWith(ext));
+            }
+            
+            function getFileTypeBadge(filename) {
+                if (isVideoFile(filename)) return '视频';
+                if (isImageFile(filename)) return '图片';
+                if (isPdfFile(filename)) return 'PDF';
+                if (isDocumentFile(filename)) return '文档';
+                return '文件';
+            }
+            
+            // 格式化日期
+            function formatDate(dateString) {
+                const date = new Date(dateString);
+                return date.toLocaleDateString('zh-CN');
+            }
+            
+            // 搜索处理
+            function handleSearch() {
+                const searchTerm = document.getElementById('searchInput').value.trim();
+                loadDirectories(searchTerm);
+            }
+            
+            function handleSearchKeyPress(event) {
+                if (event.key === 'Enter') {
+                    handleSearch();
+                }
+            }
+            
+            // 打开目录
+            async function openDirectory(path, dbId = null) {
+                try {
+                    updateStatus('正在打开目录...');
+
+                    const requestData = { path: path };
+                    if (dbId) {
+                        requestData.db_id = dbId;
+                    }
+                    
+                    const response = await fetch('/api/open', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(requestData)
+                    });
+                    
+                    const result = await response.json();
+                    if (result.success) {
+                        updateStatus('目录已打开');
+                    } else {
+                        updateStatus('打开失败: ' + result.error, 'error');
+                    }
+                } catch (error) {
+                    updateStatus('打开失败: ' + error.message, 'error');
+                }
+            }
+
+            // 显示媒体（图片、视频、PDF或文档）
+            async function showMedia(path, mediaType) {
+                try {
+                    const decodedPath = decodeURIComponent(path);
+                    
+                    if (mediaType === 'video') {
+                        // 视频播放
+                        const videoUrl = '/api/video?path=' + encodeURIComponent(decodedPath);
+                        const modalVideo = document.getElementById('modalVideo');
+                        const modalImage = document.getElementById('modalImage');
+                        const modal = document.getElementById('mediaModal');
+                        
+                        modalVideo.src = videoUrl;
+                        modalVideo.style.display = 'block';
+                        modalImage.style.display = 'none';
+                        modal.style.display = 'flex';
+                        
+                    } else if (mediaType === 'pdf') {
+                        // PDF显示
+                        showPdfModal(decodedPath);
+                        
+                    } else if (mediaType === 'document') {
+                        // 检查是否是EPUB文件
+                        if (decodedPath.toLowerCase().endsWith('.epub')) {
+                            // EPUB文件在新窗口中打开高级阅读器
+                            const epubUrl = '/api/document?path=' + encodeURIComponent(decodedPath) + '&preview=true';
+                            const windowFeatures = 'width=1200,height=800,resizable=yes,scrollbars=yes';
+                            window.open(epubUrl, '_blank', windowFeatures);
+                        } else {
+                            // 其他文档显示
+                            showDocumentModal(decodedPath);
+                        }
+                        
+                    } else {
+                        // 图片显示
+                        const coverUrl = '/api/cover?path=' + encodeURIComponent(decodedPath);
+                        const modalImage = document.getElementById('modalImage');
+                        const modalVideo = document.getElementById('modalVideo');
+                        const modal = document.getElementById('mediaModal');
+                        
+                        modalImage.src = coverUrl;
+                        modalImage.style.display = 'block';
+                        modalVideo.style.display = 'none';
+                        modal.style.display = 'flex';
+                    }
+                } catch (error) {
+                    console.error('显示媒体失败:', error);
+                    alert('无法加载媒体文件: ' + error.message);
+                }
+            }
+            
+            // 显示PDF模态框
+            function showPdfModal(pdfPath) {
+                const pdfModal = document.getElementById('pdfModal');
+                const pdfIframe = document.getElementById('modalPdf');
+                const pdfTitle = document.getElementById('pdfModalTitle');
+                
+                // 设置PDF标题
+                const fileName = pdfPath.split('/').pop() || 'PDF文档';
+                pdfTitle.textContent = `PDF预览 - ${fileName}`;
+                
+                // 构建PDF URL
+                const pdfUrl = '/api/pdf?path=' + encodeURIComponent(pdfPath);
+                pdfIframe.src = pdfUrl;
+                
+                // 重置缩放
+                currentPdfZoom = 1.0;
+                updatePdfZoomInfo();
+                
+                // 显示模态框
+                pdfModal.style.display = 'flex';
+                
+                // 添加键盘事件监听
+                document.addEventListener('keydown', handlePdfKeydown);
+            }
+            
+            // PDF键盘控制
+            function handlePdfKeydown(event) {
+                const pdfModal = document.getElementById('pdfModal');
+                if (pdfModal.style.display !== 'flex') return;
+                
+                switch (event.key) {
+                    case 'Escape':
+                        closePdfModal();
+                        break;
+                    case '+':
+                    case '=':
+                        event.preventDefault();
+                        zoomInPdf();
+                        break;
+                    case '-':
+                        event.preventDefault();
+                        zoomOutPdf();
+                        break;
+                    case '0':
+                        event.preventDefault();
+                        fitToWidthPdf();
+                        break;
+                }
+            }
+            
+            // PDF控制函数
+            function downloadPdf() {
+                const pdfIframe = document.getElementById('modalPdf');
+                const pdfUrl = pdfIframe.src;
+                const link = document.createElement('a');
+                link.href = pdfUrl;
+                link.download = 'document.pdf';
+                link.click();
+            }
+            
+            function printPdf() {
+                const pdfIframe = document.getElementById('modalPdf');
+                pdfIframe.contentWindow.print();
+            }
+            
+            function zoomInPdf() {
+                currentPdfZoom = Math.min(currentPdfZoom + 0.1, 3.0);
+                applyPdfZoom();
+            }
+            
+            function zoomOutPdf() {
+                currentPdfZoom = Math.max(currentPdfZoom - 0.1, 0.5);
+                applyPdfZoom();
+            }
+            
+            function fitToWidthPdf() {
+                currentPdfZoom = 1.0;
+                applyPdfZoom();
+            }
+            
+            function fitToPagePdf() {
+                currentPdfZoom = 1.0;
+                applyPdfZoom();
+            }
+            
+            function applyPdfZoom() {
+                const pdfIframe = document.getElementById('modalPdf');
+                try {
+                    pdfIframe.style.transform = `scale(${currentPdfZoom})`;
+                    pdfIframe.style.transformOrigin = '0 0';
+                    updatePdfZoomInfo();
+                } catch (e) {
+                    console.error('应用PDF缩放失败:', e);
+                }
+            }
+            
+            function updatePdfZoomInfo() {
+                const zoomInfo = document.getElementById('pdfToolbarInfo');
+                zoomInfo.textContent = `缩放: ${Math.round(currentPdfZoom * 100)}%`;
+            }
+            
+            // 关闭PDF模态框
+            function closePdfModal() {
+                const pdfModal = document.getElementById('pdfModal');
+                const pdfIframe = document.getElementById('modalPdf');
+                
+                pdfIframe.src = '';
+                pdfIframe.style.transform = '';
+                pdfModal.style.display = 'none';
+                
+                document.removeEventListener('keydown', handlePdfKeydown);
+            }
+
+            // 显示文档模态框
+            function showDocumentModal(docPath) {
+                const docModal = document.getElementById('documentModal');
+                const docIframe = document.getElementById('modalDocument');
+                const docTitle = document.getElementById('documentModalTitle');
+                
+                // 设置文档标题
+                const fileName = docPath.split('/').pop() || '文档';
+                docTitle.textContent = `文档预览 - ${fileName}`;
+                
+                // 构建文档URL
+                const docUrl = '/api/document?path=' + encodeURIComponent(docPath);
+                docIframe.src = docUrl;
+                
+                // 重置缩放
+                currentDocumentZoom = 1.0;
+                updateDocumentZoomInfo();
+                
+                // 显示模态框
+                docModal.style.display = 'flex';
+                
+                // 添加键盘事件监听
+                document.addEventListener('keydown', handleDocumentKeydown);
+            }
+
+            // 文档键盘控制
+            function handleDocumentKeydown(event) {
+                const docModal = document.getElementById('documentModal');
+                if (docModal.style.display !== 'flex') return;
+                
+                switch (event.key) {
+                    case 'Escape':
+                        closeDocumentModal();
+                        break;
+                    case '+':
+                    case '=':
+                        event.preventDefault();
+                        zoomInDocument();
+                        break;
+                    case '-':
+                        event.preventDefault();
+                        zoomOutDocument();
+                        break;
+                }
+            }
+
+            // 文档控制函数
+            function downloadDocument() {
+                const docIframe = document.getElementById('modalDocument');
+                const docUrl = docIframe.src;
+                const link = document.createElement('a');
+                link.href = docUrl;
+                link.download = 'document';
+                link.click();
+            }
+
+            function printDocument() {
+                const docIframe = document.getElementById('modalDocument');
+                docIframe.contentWindow.print();
+            }
+
+            function zoomInDocument() {
+                const docIframe = document.getElementById('modalDocument');
+                try {
+                    currentDocumentZoom = Math.min(currentDocumentZoom + 0.1, 3.0);
+                    docIframe.style.zoom = currentDocumentZoom;
+                    updateDocumentZoomInfo();
+                } catch (e) {
+                    console.error('文档放大失败:', e);
+                }
+            }
+
+            function zoomOutDocument() {
+                const docIframe = document.getElementById('modalDocument');
+                try {
+                    currentDocumentZoom = Math.max(currentDocumentZoom - 0.1, 0.5);
+                    docIframe.style.zoom = currentDocumentZoom;
+                    updateDocumentZoomInfo();
+                } catch (e) {
+                    console.error('文档缩小失败:', e);
+                }
+            }
+
+            function updateDocumentZoomInfo() {
+                const zoomInfo = document.getElementById('documentToolbarInfo');
+                zoomInfo.textContent = `缩放: ${Math.round(currentDocumentZoom * 100)}%`;
+            }
+
+            // 关闭文档模态框
+            function closeDocumentModal() {
+                const docModal = document.getElementById('documentModal');
+                const docIframe = document.getElementById('modalDocument');
+                
+                docIframe.src = '';
+                docIframe.style.zoom = '';
+                docModal.style.display = 'none';
+                
+                document.removeEventListener('keydown', handleDocumentKeydown);
+            }
+            
+            // 视频控制函数
+            function playPauseVideo() {
+                const video = document.getElementById('modalVideo');
+                if (video.paused) {
+                    video.play();
+                } else {
+                    video.pause();
+                }
+            }
+            
+            function muteUnmuteVideo() {
+                const video = document.getElementById('modalVideo');
+                video.muted = !video.muted;
+            }
+            
+            function fullscreenVideo() {
+                const video = document.getElementById('modalVideo');
+                if (video.requestFullscreen) {
+                    video.requestFullscreen();
+                } else if (video.webkitRequestFullscreen) {
+                    video.webkitRequestFullscreen();
+                } else if (video.mozRequestFullScreen) {
+                    video.mozRequestFullScreen();
+                }
+            }
+            
+            // 关闭模态框
+            function closeMediaModal() {
+                const modal = document.getElementById('mediaModal');
+                const video = document.getElementById('modalVideo');
+                
+                if (video && !video.paused) {
+                    video.pause();
+                }
+                
+                modal.style.display = 'none';
+            }
+            
+            // 键盘快捷键
+            document.addEventListener('keydown', function(event) {
+                const pdfModal = document.getElementById('pdfModal');
+                if (pdfModal.style.display === 'flex') {
+                    if (event.key === 'Escape') {
+                        closePdfModal();
+                    }
+                }
+                
+                const docModal = document.getElementById('documentModal');
+                if (docModal.style.display === 'flex') {
+                    if (event.key === 'Escape') {
+                        closeDocumentModal();
+                    }
+                }
+                
+                const mediaModal = document.getElementById('mediaModal');
+                if (mediaModal.style.display === 'flex') {
+                    if (event.key === 'Escape') {
+                        closeMediaModal();
+                    } else if (event.key === ' ') {
+                        event.preventDefault();
+                        playPauseVideo();
+                    }
+                }
+                
+                if ((event.ctrlKey || event.metaKey) && event.key === 'f') {
+                    event.preventDefault();
+                    document.getElementById('searchInput').focus();
+                }
+            });
+
+            // 显示数据库信息
+            async function showDatabaseInfo(dbId) {
+                try {
+                    const response = await fetch('/api/directory/' + dbId);
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        alert('数据库信息:\\n' +
+                            'ID: ' + data.directory.id + '\\n' +
+                            '名称: ' + data.directory.name + '\\n' +
+                            '路径: ' + data.directory.path + '\\n' +
+                            '创建时间: ' + data.directory.created_time + '\\n' +
+                            '最后修改: ' + data.directory.last_modified + '\\n' +
+                            '状态: ' + (data.directory.exists ? '上架' : '下架') + '\\n' +
+                            '类型: ' + (data.directory.is_directory ? '目录' : '文件'));
+                    } else {
+                        alert('获取数据库信息失败: ' + data.error);
+                    }
+                } catch (error) {
+                    alert('获取数据库信息失败: ' + error.message);
+                }
+            }
+            
+            // 开始扫描
+            async function startScan() {
+                try {
+                    updateStatus('开始扫描目录...');
+                    const response = await fetch('/api/scan', { method: 'POST' });
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        updateStatus('扫描完成');
+                        setTimeout(() => loadDirectories(), 1000);
+                    } else {
+                        updateStatus('扫描失败: ' + result.error, 'error');
+                    }
+                } catch (error) {
+                    updateStatus('扫描失败: ' + error.message, 'error');
+                }
+            }
+            
+            // 显示系统信息
+            function showSystemInfo() {
+                alert('系统信息:\\n' +
+                    '名称: ''' + ProjectInfo.NAME + '''\\n' +
+                    '版本: ''' + ProjectInfo.VERSION + '''\\n' +
+                    '作者: ''' + ProjectInfo.AUTHOR + '''\\n' +
+                    '描述: ''' + ProjectInfo.DESCRIPTION + '''\\n' +
+                    '技术支持: ''' + ProjectInfo.URL + '''');
+            }
+            
+            // 更新系统状态
+            async function updateSystemStatus() {
+                try {
+                    const response = await fetch('/api/status');
+                    const data = await response.json();
+                    
+                    const statusInfo = document.getElementById('statusInfo');
+                    statusInfo.innerHTML = 
+                        '🟢 系统运行中 | ' +
+                        '用户: ' + (data.current_user || '未登录') + ' | ' +
+                        '扫描模式: ' + data.scan_mode + ' | ' +
+                        '版本: ''' + ProjectInfo.VERSION + '''';
+                } catch (error) {
+                    console.error('更新状态失败:', error);
+                }
+            }
+            
+            // 更新项目计数
+            function updateItemCount(count) {
+                document.getElementById('itemCount').textContent = '共 ' + count + ' 个项目';
+            }
+            
+            // 更新状态信息
+            function updateStatus(message, type = 'info') {
+                const statusInfo = document.getElementById('statusInfo');
+                statusInfo.textContent = message;
+                statusInfo.style.color = type === 'error' ? '#ff4444' : '#666';
+            }
+            
+            // 显示加载状态
+            function showLoading() {
+                const container = document.getElementById('directoriesContainer');
+                container.innerHTML = '<div class="loading">正在加载...</div>';
+                updateStatus('正在加载数据...');
+            }
+            
+            // 显示错误
+            function showError(message) {
+                const container = document.getElementById('directoriesContainer');
+                container.innerHTML = '<div class="no-results">❌ ' + message + '</div>';
+            }
+        </script>
+    </body>
+    </html>
+    '''
+
+    def get_directories_data(self):
+        """获取目录数据 - 添加数据库ID"""
+        if not self.main_app or not self.main_app.user_manager.current_db_path:
+            return {"directories": [], "count": 0}
+        
+        try:
+            conn = sqlite3.connect(self.main_app.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            # 修改查询语句，包含id字段
+            cursor.execute("""
+                SELECT id, name, path, directory_exists, created_time, last_modified, is_directory 
+                FROM directories 
+                ORDER BY name
+            """)
+            
+            directories = []
+            results = cursor.fetchall()
+            
+            # 添加调试信息
+            print(f"[DEBUG] 数据库查询结果数量: {len(results)}")
+            if results:
+                print(f"[DEBUG] 第一条结果: {results[0]}")
+                print(f"[DEBUG] 结果列数: {len(results[0])}")
+            
+            for row in results:
+                try:
+                    # 安全解包，确保有7个字段
+                    if len(row) == 7:
+                        db_id, name, path, exists, created_time, last_modified, is_directory = row
+                    else:
+                        print(f"[WARNING] 数据库行字段数量不正确: {len(row)}")
+                        continue
+                        
+                    try:
+                        # 添加路径分析信息用于调试
+                        path_parts = path.split('/') if '/' in path else path.split('\\')
+                        debug_info = {
+                            "total_parts": len(path_parts),
+                            "last_part": path_parts[-1] if path_parts else "",
+                            "parent_part": path_parts[-2] if len(path_parts) >= 2 else "",
+                            "has_separator_issue": len(path_parts) >= 4 and 
+                                                path_parts[-1].startswith(path_parts[-2]) and 
+                                                len(path_parts[-1]) > len(path_parts[-2])
+                        }
+                    except Exception as e:
+                        # 如果路径分析出错，使用默认的调试信息
+                        debug_info = {
+                            "total_parts": 0,
+                            "last_part": "",
+                            "parent_part": "",
+                            "has_separator_issue": False,
+                            "error": str(e)
+                        }
+                    
+                    directories.append({
+                        "id": db_id,  # 新增：数据库ID
+                        "name": name,
+                        "path": path,
+                        "exists": bool(exists),
+                        "created_time": created_time,
+                        "last_modified": last_modified,
+                        "is_directory": bool(is_directory),
+                        "debug": debug_info
+                    })
+
+                    print(f"[SERVER DEBUG] 目录: {name}, 路径: {path}, ID: {db_id}")
+                    
+                except Exception as e:
+                    print(f"[ERROR] 处理数据库行时出错: {e}, 行数据: {row}")
+                    continue
+            
+            print(f"[SERVER DEBUG] 成功获取 {len(directories)} 条目录数据")
+            conn.close()
+        
+            # 打印有问题的路径
+            problematic_paths = [d for d in directories if d["debug"]["has_separator_issue"]]
+            if problematic_paths:
+                print(f"[SERVER DEBUG] 发现 {len(problematic_paths)} 个可能有分隔符问题的路径:")
+                for d in problematic_paths:
+                    print(f"  - {d['path']} -> 应该为: .../{d['debug']['parent_part']}/{d['debug']['last_part'][len(d['debug']['parent_part']):]}")
+            
+            return {"directories": directories, "count": len(directories)}
+            
+        except Exception as e:
+            print(f"[SERVER ERROR] 获取目录数据失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"directories": [], "count": 0, "error": str(e)}
+
+    
+    def handle_search_request(self, query_string):
+        """处理搜索请求"""
+        query_params = urllib.parse.parse_qs(query_string)
+        search_term = query_params.get('q', [''])[0].lower()
+        
+        if not search_term:
+            self.send_json_response(self.get_directories_data())
+            return
+        
+        data = self.get_directories_data()
+        directories = data["directories"]
+        
+        # 过滤匹配的目录
+        filtered_directories = []
+        for dir_info in directories:
+            name = dir_info["name"].lower()
+            path = dir_info["path"].lower()
+            
+            # 普通文本匹配
+            if search_term in name or search_term in path:
+                filtered_directories.append(dir_info)
+                continue
+            
+            # 拼音首字母匹配
+            if PinyinSearchHelper.contains_pinyin_initials(dir_info["name"], search_term):
+                filtered_directories.append(dir_info)
+        
+        self.send_json_response({
+            "directories": filtered_directories,
+            "count": len(filtered_directories),
+            "search_term": search_term
+        })
+    
+    def handle_cover_request(self, query_string):
+        """处理封面图片请求"""
+        query_params = urllib.parse.parse_qs(query_string)
+        path = query_params.get('path', [''])[0]
+        
+        if not path:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing path parameter")
+            return
+        
+        try:
+            directory_path = urllib.parse.unquote(path)
+
+            # === 新增：路径规范化 ===
+            if self.main_app and hasattr(self.main_app, 'normalize_path_separators'):
+                directory_path = self.main_app.normalize_path_separators(directory_path)
+
+            # 查找封面图片
+            cover_path = self.main_app.find_cover_image(directory_path) if self.main_app else None
+            
+            if cover_path and os.path.exists(cover_path):
+                # 发送图片文件
+                self.send_file_response(cover_path, 'image/jpeg')
+            else:
+                # 返回默认图片
+                self.send_default_cover()
+                
+        except Exception as e:
+            print(f"[SERVER ERROR] 获取封面失败: {e}")
+            self.send_default_cover()
+    
+    def handle_open_request(self, query_string):
+        """处理打开目录请求 - 强制使用数据库路径"""
+        query_params = urllib.parse.parse_qs(query_string)
+        path = query_params.get('path', [''])[0]
+        print(f"[DEBUG] Received open GET path: {path}")
+
+        if not path:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing path parameter")
+            return
+        
+        try:
+            directory_path = urllib.parse.unquote(path)
+        
+            # === 新增：路径规范化处理 ===
+            # 修复反斜杠转义问题
+            normalized_path = directory_path.replace('\\', '/')
+            print(f"[DEBUG] After normalization: {normalized_path}")
+            
+            # 如果规范化后的路径与原始路径不同，使用规范化路径
+            if normalized_path != directory_path:
+                directory_path = normalized_path
+                print(f"[DEBUG] Using normalized path: {directory_path}")
+            
+            # === 新增：强制使用数据库路径查询 ===
+            db_path = None
+            if self.main_app and hasattr(self.main_app, 'user_manager') and self.main_app.user_manager.current_db_path:
+                try:
+                    conn = sqlite3.connect(self.main_app.user_manager.current_db_path)
+                    cursor = conn.cursor()
+                    
+                    basename = os.path.basename(directory_path)
+                    
+                    # 多种策略查询数据库路径
+                    cursor.execute("SELECT path FROM directories WHERE name = ? OR path LIKE ?", 
+                                (basename, f"%{basename}%"))
+                    results = cursor.fetchall()
+                    conn.close()
+                    
+                    if results:
+                        # 优先精确匹配
+                        for result in results:
+                            candidate_path = result[0]
+                            if candidate_path.endswith(basename):
+                                db_path = candidate_path
+                                break
+                        
+                        if not db_path and results:
+                            db_path = results[0][0]
+                    
+                except Exception as e:
+                    print(f"[DATABASE ERROR] 查询数据库路径失败: {e}")
+            
+            # === 修改：必须使用数据库路径 ===
+            if not db_path:
+                self.send_json_response({
+                    "success": False,
+                    "error": f"在数据库中找不到对应的路径: {directory_path}",
+                    "original_get_path": directory_path
+                })
+                return
+            
+            final_path = db_path
+            print(f"[DEBUG] GET请求最终使用的数据库路径: {final_path}")
+            
+            # 使用线程安全的方式调用
+            success = False
+            error_msg = ""
+            
+            if self.main_app and hasattr(self.main_app, 'open_directory'):
+                success = QMetaObject.invokeMethod(
+                    self.main_app, 
+                    "open_directory", 
+                    Qt.QueuedConnection,
+                    Q_ARG(str, final_path)
+                )
+                
+                if not success:
+                    error_msg = "无法调用打开目录方法"
+                else:
+                    success = True
+            else:
+                error_msg = "没有可用的打开目录方法"
+            
+            self.send_json_response({
+                "success": success,
+                "path": final_path,
+                "database_path_used": True,
+                "original_get_path": directory_path,
+                "error": error_msg if not success else None
+            })
+            
+        except Exception as e:
+            print(f"[SERVER ERROR] 打开目录失败: {e}")
+            self.send_json_response({
+                "success": False,
+                "path": path,
+                "database_path_used": False,
+                "error": str(e)
+            })
+
+
+
+    def handle_open_post(self, data):
+        """处理POST打开目录请求 - 支持数据库ID"""
+        print(f"[DEBUG] Received open POST data: {data}")
+        
+        path = data.get('path', '')
+        db_id = data.get('db_id')  # 新增：获取数据库ID
+        
+        print(f"[DEBUG] Extracted path: {path}, DB ID: {db_id}")
+
+        if not path and not db_id:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing path or db_id parameter")
+            return
+
+        try:
+            # 如果提供了数据库ID，优先使用数据库ID查询路径
+            if db_id:
+                db_path = self.get_path_by_id(db_id)
+                if db_path:
+                    path = db_path
+                    print(f"[DEBUG] 使用数据库ID {db_id} 查询到的路径: {path}")
+                else:
+                    self.send_json_response({
+                        "success": False,
+                        "error": f"在数据库中找不到ID为 {db_id} 的目录",
+                        "db_id": db_id
+                    })
+                    return
+        except Exception as e:
+            print(f"[ERROR] 通过数据库ID查询路径失败: {e}")
+            # 如果通过ID查询失败，继续使用原始路径
+
+        try:
+            print(f"[DEBUG] Original path: {path}")
+    
+            # === 新增：路径解析修复 ===
+            # 检查路径是否缺少分隔符（如 BBAPNS-076 应该是 BB/APNS-076）
+            if '//' in path and not path.replace('//', '/').count('/') >= 4:
+                # 尝试从数据库查找正确的路径结构
+                corrected_path = self.attempt_path_correction(path)
+                if corrected_path and corrected_path != path:
+                    print(f"[PATH CORRECTION] 路径已修正: {path} -> {corrected_path}")
+                    path = corrected_path
+        
+            # === 新增：使用专门的修复方法 ===
+            path = self.fix_missing_separator(path)
+            
+            # === 原有的路径规范化处理 ===
+            # 修复反斜杠转义问题
+            normalized_path = path.replace('\\', '/')
+            print(f"[DEBUG] After normalization: {normalized_path}")
+            
+            # 如果规范化后的路径与原始路径不同，使用规范化路径
+            if normalized_path != path:
+                path = normalized_path
+                print(f"[DEBUG] Using normalized path: {path}")
+            
+            # === 修改：强制使用数据库路径，如果找不到就报错 ===
+            db_path = None
+            if self.main_app and hasattr(self.main_app, 'user_manager') and self.main_app.user_manager.current_db_path:
+                print(f"[DATABASE PATH] 查询数据库路径 for: {path}")
+                try:
+                    conn = sqlite3.connect(self.main_app.user_manager.current_db_path)
+                    cursor = conn.cursor()
+                    
+                    # 多种策略查询数据库中的路径
+                    basename = os.path.basename(path)
+                    print(f"[DATABASE PATH] 查询目录名称: {basename}")
+                    
+                    # 策略1: 精确匹配路径
+                    cursor.execute("SELECT path FROM directories WHERE path = ?", (path,))
+                    results = cursor.fetchall()
+                    
+                    # 策略2: 精确匹配名称
+                    if not results:
+                        cursor.execute("SELECT path FROM directories WHERE name = ?", (basename,))
+                        results = cursor.fetchall()
+                        print(f"[DATABASE PATH] 名称匹配结果数: {len(results)}")
+                    
+                    # 策略3: 路径包含匹配
+                    if not results:
+                        cursor.execute("SELECT path FROM directories WHERE path LIKE ?", (f"%{basename}%",))
+                        results = cursor.fetchall()
+                        print(f"[DATABASE PATH] 路径包含匹配结果数: {len(results)}")
+                    
+                    # 策略4: 路径结尾匹配
+                    if not results:
+                        cursor.execute("SELECT path FROM directories WHERE path LIKE ?", (f"%{basename}",))
+                        results = cursor.fetchall()
+                        print(f"[DATABASE PATH] 路径结尾匹配结果数: {len(results)}")
+                    
+                    conn.close()
+                    
+                    if results:
+                        # 优先选择路径最匹配的结果
+                        for result in results:
+                            candidate_path = result[0]
+                            if candidate_path.endswith(basename):
+                                db_path = candidate_path
+                                print(f"[DATABASE PATH] 找到精确匹配的数据库路径: {db_path}")
+                                break
+                        
+                        # 如果没有精确匹配，使用第一个结果
+                        if not db_path and results:
+                            db_path = results[0][0]
+                            print(f"[DATABASE PATH] 使用第一个数据库路径: {db_path}")
+
+
+
+                except Exception as e:
+                    print(f"[DATABASE ERROR] 查询数据库路径失败: {e}")
+                    self.send_json_response({
+                        "success": False,
+                        "error": f"数据库查询失败: {str(e)}",
+                        "original_post_path": path
+                    })
+                    return
+            
+            # === 修改：必须使用数据库路径，如果找不到就报错 ===
+            if not db_path:
+                print(f"[DATABASE ERROR] 在数据库中找不到对应的路径: {path}")
+                self.send_json_response({
+                    "success": False,
+                    "error": f"在数据库中找不到对应的路径: {path}",
+                    "original_post_path": path,
+                    "suggestion": "请确保该目录已被扫描并保存到数据库"
+                })
+                return
+            
+            final_path = db_path
+            print(f"[DEBUG] 最终使用的数据库路径: {final_path}")
+            
+            # 路径规范化
+            print(f"[DEBUG] Path before normalization: {final_path}")
+            if hasattr(self.main_app, 'normalize_path_separators'):
+                final_path = self.main_app.normalize_path_separators(final_path)
+                print(f"[DEBUG] Path after normalization: {final_path}")
+
+            # 使用线程安全的方式调用主应用程序的打开目录方法
+            success = False
+            error_msg = ""
+            
+            if self.main_app:
+                # 使用Qt的信号槽机制确保在主线程中执行
+                if hasattr(self.main_app, 'open_directory'):
+                    # 使用invokeMethod确保在主线程中执行
+                    success = QMetaObject.invokeMethod(
+                        self.main_app, 
+                        "open_directory", 
+                        Qt.QueuedConnection,  # 使用队列连接确保线程安全
+                        Q_ARG(str, final_path)
+                    )
+                    
+                    if not success:
+                        error_msg = "无法调用打开目录方法"
+                    else:
+                        # 假设调用成功，实际结果需要主应用程序处理
+                        success = True
+                else:
+                    error_msg = "主应用程序没有打开目录方法"
+            else:
+                error_msg = "主应用程序不可用"
+            
+            self.send_json_response({
+                "success": success,
+                "path": final_path,
+                "db_id": db_id,  # 新增：返回数据库ID
+                "database_path_used": True,
+                "original_post_path": path,
+                "error": error_msg if not success else None
+            })
+            
+        except Exception as e:
+            print(f"[SERVER ERROR] 打开目录失败: {e}")
+            self.send_json_response({
+                "success": False,
+                "error": str(e),
+                "db_id": db_id,
+                "original_post_path": path,
+                "database_path_used": False
+            })
+
+    def get_path_by_id(self, db_id):
+        """根据数据库ID获取路径"""
+        if not self.main_app or not self.main_app.user_manager.current_db_path:
+            return None
+        
+        try:
+            conn = sqlite3.connect(self.main_app.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT path FROM directories WHERE id = ?", (db_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return result[0]
+            return None
+            
+        except Exception as e:
+            print(f"[DATABASE ERROR] 根据ID查询路径失败: {e}")
+            return None
+
+    def fix_missing_separator(self, path):
+        """修复路径中缺少的分隔符"""
+        if not path or '//' not in path:
+            return path
+        
+        # 将双斜杠替换为单斜杠
+        normalized = path.replace('//', '/')
+        
+        # 分析路径结构
+        parts = [part for part in normalized.split('/') if part]
+        if len(parts) < 4:
+            return normalized
+        
+        # 检查最后一部分是否包含父目录名称
+        last_part = parts[-1]
+        parent_part = parts[-2]
+        
+        # 如果最后一部分以父目录名称开头且长度更长，说明缺少分隔符
+        if (last_part.startswith(parent_part) and 
+            len(last_part) > len(parent_part) and
+            not last_part[len(parent_part):].startswith('/')):
+            
+            # 在父目录名称后插入分隔符
+            fixed_last = parent_part + '/' + last_part[len(parent_part):]
+            parts[-2:] = [parent_part, last_part[len(parent_part):]]
+            
+            fixed_path = '/' + '/'.join(parts)
+            print(f"[SEPARATOR FIX] 修复路径分隔符: {normalized} -> {fixed_path}")
+            return fixed_path
+        
+        return normalized
+
+
+
+    def attempt_path_correction(self, problematic_path):
+        """尝试修正路径分隔符问题"""
+        if not self.main_app or not self.main_app.user_manager.current_db_path:
+            return problematic_path
+        
+        try:
+            conn = sqlite3.connect(self.main_app.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            # 获取路径的基本名称部分
+            basename = os.path.basename(problematic_path)
+            print(f"[PATH CORRECTION] 尝试修正路径: {problematic_path}, 基本名称: {basename}")
+            
+            # 策略1: 在数据库中查找包含这个基本名称的路径
+            cursor.execute("SELECT path FROM directories WHERE path LIKE ?", (f"%{basename}%",))
+            results = cursor.fetchall()
+            
+            if results:
+                # 找到多个可能路径时，选择最匹配的一个
+                for db_path, in results:
+                    # 检查数据库路径是否包含正确的目录结构
+                    db_basename = os.path.basename(db_path)
+                    if db_basename == basename:
+                        # 完全匹配，直接返回
+                        print(f"[PATH CORRECTION] 找到完全匹配: {db_path}")
+                        return db_path
+                    
+                    # 检查是否是子目录关系
+                    parent_dir = os.path.dirname(db_path)
+                    parent_basename = os.path.basename(parent_dir)
+                    
+                    # 如果问题路径像是缺少了分隔符（如 BBAPNS-076 应该是 BB/APNS-076）
+                    if parent_basename and basename.startswith(parent_basename):
+                        # 提取子目录名称
+                        subdir_name = basename[len(parent_basename):]
+                        if subdir_name and not subdir_name.startswith('/'):
+                            # 构建正确的路径
+                            corrected = os.path.join(parent_dir, subdir_name)
+                            print(f"[PATH CORRECTION] 推测正确路径: {corrected}")
+                            
+                            # 验证这个路径是否在数据库中
+                            cursor.execute("SELECT path FROM directories WHERE path = ?", (corrected,))
+                            if cursor.fetchone():
+                                return corrected
+            
+            conn.close()
+            
+        except Exception as e:
+            print(f"[PATH CORRECTION ERROR] 路径修正失败: {e}")
+        
+        return problematic_path
+
+
+
+    
+    def handle_scan_request(self):
+        """处理扫描请求"""
+        try:
+            success = False
+            error_msg = ""
+            
+            if self.main_app:
+                # === 修复：使用信号槽机制在主线程中执行扫描 ===
+                def run_scan_in_main_thread():
+                    try:
+                        # 确保在主线程中执行
+                        if hasattr(self.main_app, 'scan_directories'):
+                            # 使用单次定时器确保在主线程事件循环中执行
+                            QTimer.singleShot(0, self.main_app.scan_directories)
+                    except Exception as e:
+                        print(f"[SERVER ERROR] 扫描失败: {e}")
+                
+                # 如果已经在主线程，直接调用
+                if QThread.currentThread() == self.main_app.thread():
+                    self.main_app.scan_directories()
+                    success = True
+                else:
+                    # 否则使用信号槽机制
+                    QTimer.singleShot(0, self.main_app.scan_directories)
+                    success = True
+            else:
+                error_msg = "Main application not available"
+            
+            self.send_json_response({
+                "success": success,
+                "message": "扫描已开始" if success else error_msg,
+                "error": error_msg if not success else None
+            })
+            
+        except Exception as e:
+            self.send_json_response({
+                "success": False,
+                "error": str(e)
+            })
+
+    
+    def get_system_status(self):
+        """获取系统状态"""
+        status = {
+            "version": ProjectInfo.VERSION,
+            "name": ProjectInfo.NAME,
+            "status": "running",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        
+        if self.main_app:
+            status.update({
+                "current_user": self.main_app.user_manager.current_user,
+                "scan_mode": self.main_app.get_setting('scan_mode', 'directories'),
+                "auto_scan": self.main_app.get_setting('auto_scan', '1') == '1'
+            })
+        
+        return status
+    
+    def send_html_response(self, html_content):
+        """发送HTML响应"""
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(html_content.encode('utf-8'))))
+        self.end_headers()
+        self.wfile.write(html_content.encode('utf-8'))
+    
+    def send_json_response(self, data):
+        """发送JSON响应"""
+        json_data = json.dumps(data, ensure_ascii=False, indent=2)
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(json_data.encode('utf-8'))))
+        self.end_headers()
+        self.wfile.write(json_data.encode('utf-8'))
+    
+    def send_file_response(self, file_path, content_type):
+        """发送文件响应"""
+        try:
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+            
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-type', content_type)
+            self.send_header('Content-Length', str(len(file_data)))
+            self.end_headers()
+            self.wfile.write(file_data)
+            
+        except Exception as e:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+    
+    def send_default_cover(self):
+        """发送默认封面图片"""
+        # 创建一个简单的SVG作为默认封面
+        svg_content = '''
+        <svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
+            <rect width="200" height="200" fill="#f8f9fa"/>
+            <text x="100" y="100" font-family="Arial" font-size="14" fill="#6c757d" 
+                  text-anchor="middle" dy="0.35em">📁 无封面图片</text>
+        </svg>
+        '''
+        
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-type', 'image/svg+xml')
+        self.send_header('Content-Length', str(len(svg_content)))
+        self.end_headers()
+        self.wfile.write(svg_content.encode('utf-8'))
+    
+    def log_message(self, format, *args):
+        """重写日志消息格式，过滤掉连接重置的噪音"""
+        message = format % args
+        # 过滤掉连接重置的日志噪音
+        if "10054" in message or "远程主机强迫关闭" in message:
+            print(f"[HTTP INFO] 客户端断开连接 (正常行为)")
+        else:
+            print(f"[HTTP SERVER] {message}")
+
+
+
+    def handle_pdf_request(self, query_string):
+        """处理PDF文件请求"""
+        query_params = urllib.parse.parse_qs(query_string)
+        path = query_params.get('path', [''])[0]
+        
+        if not path:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing path parameter")
+            return
+        
+        try:
+            pdf_path = urllib.parse.unquote(path)
+            
+            # 路径规范化
+            if self.main_app and hasattr(self.main_app, 'normalize_path_separators'):
+                pdf_path = self.main_app.normalize_path_separators(pdf_path)
+            
+            # 检查文件是否存在且是PDF文件
+            if not os.path.exists(pdf_path):
+                self.send_error(HTTPStatus.NOT_FOUND, "PDF file not found")
+                return
+            
+            # 检查文件类型
+            if not pdf_path.lower().endswith('.pdf'):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Not a PDF file")
+                return
+            
+            # 发送PDF文件
+            self.send_pdf_file(pdf_path)
+            
+        except Exception as e:
+            print(f"[SERVER ERROR] 处理PDF请求失败: {e}")
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    def send_pdf_file(self, pdf_path):
+        """发送PDF文件 - 修复编码问题"""
+        try:
+            file_size = os.path.getsize(pdf_path)
+            
+            # 获取文件名，安全处理中文字符
+            filename = os.path.basename(pdf_path)
+            
+            # 安全编码文件名，避免编码问题
+            try:
+                # 尝试UTF-8编码
+                safe_filename = filename.encode('utf-8').decode('latin-1')
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                # 如果UTF-8编码失败，使用ASCII安全名称
+                safe_filename = "document.pdf"
+            
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-Type', 'application/pdf')
+            self.send_header('Content-Length', str(file_size))
+            
+            # 使用安全的文件名
+            self.send_header('Content-Disposition', f'inline; filename="{safe_filename}"')
+            
+            # 添加编码相关的头信息
+            self.send_header('Content-Transfer-Encoding', 'binary')
+            self.end_headers()
+            
+            # 发送文件内容
+            with open(pdf_path, 'rb') as f:
+                while chunk := f.read(8192):
+                    try:
+                        self.wfile.write(chunk)
+                    except ConnectionResetError:
+                        # 客户端断开连接，正常退出
+                        print(f"[INFO] PDF传输中断: {pdf_path}")
+                        return
+                        
+        except Exception as e:
+            print(f"[SERVER ERROR] 发送PDF文件失败: {e}")
+            # 使用安全的错误发送方法
+            self.send_safe_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+
+
+class DirectoryScannerServer:
+    """目录扫描系统服务器"""
+    
+    def __init__(self, main_app, host='localhost', port=8080):
+        self.main_app = main_app
+        self.host = host
+        self.port = port
+        self.server = None
+        self.server_thread = None
+        self.is_running = False
+        self.lock = threading.Lock()
+    
+    def start(self):
+        """启动服务器"""
+        with self.lock:
+            if self.is_running:
+                print("[SERVER] 服务器已经在运行")
+                return True
+                
+        try:
+            # 创建自定义请求处理器，确保传递main_app参数和回调函数
+            def handler_factory(*args, **kwargs):
+                return DirectoryScannerHTTPRequestHandler(
+                    *args, 
+                    main_app=self.main_app,
+                    open_directory_callback=self.main_app.open_directory,  # 新增回调
+                    **kwargs
+                )
+            
+            self.server = socketserver.TCPServer((self.host, self.port), handler_factory)
+            self.server.allow_reuse_address = True
+            
+            # 在后台线程中启动服务器
+            self.server_thread = threading.Thread(target=self.server.serve_forever)
+            self.server_thread.daemon = True
+            self.server_thread.start()
+            
+            self.is_running = True
+            print(f"[SERVER] 目录扫描系统服务器已启动: http://{self.host}:{self.port}")
+            print(f"[SERVER] 可以通过浏览器访问Web客户端")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[SERVER ERROR] 启动服务器失败: {e}")
+            if "Address already in use" in str(e):
+                print(f"[SERVER TIP] 端口 {self.port} 已被占用，请尝试其他端口或关闭占用程序")
+            return False
+
+
+    
+    def stop(self):
+        """停止服务器"""
+        # === 新增：线程安全停止 ===
+        with self.lock:
+            if self.server:
+                try:
+                    self.server.shutdown()
+                    self.server.server_close()
+                    self.is_running = False
+                    print("[SERVER] 服务器已停止")
+                except Exception as e:
+                    print(f"[SERVER ERROR] 停止服务器时出错: {e}")
+    
+    def get_server_url(self):
+        """获取服务器URL"""
+        return f"http://{self.host}:{self.port}"
+
 
 # 数据库备份管理类
 class DatabaseBackupManager:
@@ -839,14 +4201,24 @@ class UserManager:
                     directory_exists INTEGER DEFAULT 1,
                     last_scanned TEXT,
                     is_main_dir INTEGER DEFAULT 0,
-                    is_directory INTEGER DEFAULT 1  -- 添加这个新列，默认为1表示是目录
+                    is_directory INTEGER DEFAULT 1
                 )
             """)
 
-            # 检查并添加缺失的列（防御性编程）
+            # 验证表结构
             cursor.execute("PRAGMA table_info(directories)")
-            columns = [column[1] for column in cursor.fetchall()]
-            
+            columns = cursor.fetchall()
+            print(f"[DEBUG] 数据库表结构: {columns}")
+
+            # 检查必需的列
+            required_columns = ['id', 'name', 'path', 'created_time', 'last_modified', 'directory_exists', 'is_directory']
+            existing_columns = [col[1] for col in columns]
+
+            for req_col in required_columns:
+                if req_col not in existing_columns:
+                    print(f"[ERROR] 缺少必需列: {req_col}")
+                    # 这里可以添加修复逻辑
+
             if 'is_directory' not in columns:
                 try:
                     cursor.execute("ALTER TABLE directories ADD COLUMN is_directory INTEGER DEFAULT 1")
@@ -1501,7 +4873,20 @@ class SettingsDialog(QDialog):
         
         filter_group.setLayout(filter_layout)
         scan_layout.addWidget(filter_group)
-        
+
+        # === 新增：服务器设置 ===
+        server_group = QGroupBox("Web服务器设置")
+        server_layout = QVBoxLayout()
+
+        # 自动启动Web服务器
+        self.auto_start_server = QCheckBox("自动启动Web服务器")
+        self.auto_start_server.setToolTip("程序启动时自动启动Web服务器")
+
+        server_layout.addWidget(self.auto_start_server)
+
+        server_group.setLayout(server_layout)
+        scan_layout.addWidget(server_group)
+
         scan_layout.addStretch()
         scan_tab.setLayout(scan_layout)
         tabs.addTab(scan_tab, "扫描设置")
@@ -1721,6 +5106,15 @@ class SettingsDialog(QDialog):
             # 默认开启
             self.skip_existing_covers.setChecked(True)
 
+        # === 新增：加载自动启动服务器设置 ===
+        cursor.execute("SELECT value FROM settings WHERE key = 'auto_start_server'")
+        result = cursor.fetchone()
+        if result:
+            self.auto_start_server.setChecked(result[0] == "1")
+        else:
+            # 默认开启
+            self.auto_start_server.setChecked(True)
+
         conn.close()
     
     def save_settings(self):
@@ -1795,6 +5189,12 @@ class SettingsDialog(QDialog):
                 ("skip_existing_covers", skip_existing_covers)
             )
 
+            # === 新增：保存自动启动服务器设置 ===
+            auto_start_server = "1" if self.auto_start_server.isChecked() else "0"
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("auto_start_server", auto_start_server)
+            )
 
             conn.commit()
 
@@ -1919,12 +5319,38 @@ class DirectoryScannerApp(QMainWindow):
         # 检查是否需要显示用户管理对话框
         if not self.user_manager.current_user:
             self.show_user_manager()
+
+        # 初始化服务器
+        self.init_server()
+
+        # === 新增：设置初始服务器状态显示 ===
+        # 延迟设置初始状态，确保UI已完全初始化
+        QTimer.singleShot(100, self.update_server_status_display)
     
+        # 延迟启动服务器，避免影响界面加载
+        QTimer.singleShot(2000, self.auto_start_web_server)
+
+        # 初始化静态文件
+        self.init_static_files()
+
+        # 初始化静态文件（在后台线程中执行）
+        self.init_static_files_async()        
+
+    def init_static_files_async(self):
+        """在后台线程中初始化静态文件"""
+        import threading
+        thread = threading.Thread(target=self.download_static_files)
+        thread.daemon = True
+        thread.start()
+
+
     def init_ui(self):
         # self.setWindowTitle("目录扫描管理系统")
-        self.setWindowTitle(f"{ProjectInfo.NAME} {ProjectInfo.VERSION} (Build: {ProjectInfo.BUILD_DATE})")
+        # self.setWindowTitle(f"{ProjectInfo.NAME} {ProjectInfo.VERSION} (Build: {ProjectInfo.BUILD_DATE})")
+        # 初始设置标题（不包含用户名，因为此时用户可能还未登录）
+        self.update_window_title()
         self.setMinimumSize(800, 600)
-        self.resize(800, 600)
+        self.resize(1000, 600)
         
         # 设置图标
         icon_path = os.path.join(self.app_dir, "icon.ico")
@@ -1941,6 +5367,26 @@ class DirectoryScannerApp(QMainWindow):
         
         # 工具栏
         toolbar = self.addToolBar("主工具栏")
+
+        # === 新增：服务器状态指示器 ===
+        self.server_status_indicator = QLabel("🔴 服务器离线")
+        self.server_status_indicator.setStyleSheet("""
+            QLabel {
+                padding: 5px 10px;
+                border: 1px solid #ccc;
+                border-radius: 10px;
+                background-color: #ffebee;
+                color: #c62828;
+                font-weight: bold;
+            }
+        """)
+        toolbar.addWidget(self.server_status_indicator)
+    
+
+        # 添加服务器控制按钮
+        self.server_action = QAction(QIcon.fromTheme("network-server"), "启动Web服务器", self)
+        self.server_action.triggered.connect(self.toggle_server)
+        toolbar.addAction(self.server_action)
         
         # 修改为"主目录管理"按钮
         main_dir_action = QAction(QIcon.fromTheme("folder-open"), "主目录管理", self)
@@ -2029,25 +5475,104 @@ class DirectoryScannerApp(QMainWindow):
 
         # 状态栏
         self.statusBar().showMessage("就绪")
-        
+
+        # === 新增：状态栏服务器信息 ===
+        self.status_server_info = QLabel("服务器: 未启动")
+        self.statusBar().addPermanentWidget(self.status_server_info)
+
         # 加载用户设置
         self.load_user_settings()
+
+
+    def init_static_files(self):
+        """初始化静态文件"""
+        static_dir = os.path.join(self.app_dir, "static")
+        os.makedirs(static_dir, exist_ok=True)
+        
+        # 检查并下载必要的静态文件
+        self.download_static_files()
     
+    def download_static_files(self):
+        """下载必要的静态文件"""
+        static_files = {
+            'epub.js': {
+                'url': 'https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js',
+                'description': 'EPUB.js库'
+            },
+            'jszip.min.js': {
+                'url': 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+                'description': 'JSZip库'
+            }
+        }
+        
+        static_dir = os.path.join(self.app_dir, "static")
+        
+        for filename, file_info in static_files.items():
+            print(f"[STATIC] 检查文件: {filename}")
+            file_path = os.path.join(static_dir, filename)
+            print(f"[STATIC] 目标路径: {file_path}")
+            
+            # 如果文件不存在或需要更新，则下载
+            if not os.path.exists(file_path):
+                print(f"[STATIC] 文件 {filename} 不存在，开始下载...")
+                self.download_file(file_info['url'], file_path, file_info['description'])
+                print(f"[STATIC] 文件 {filename} 下载完成")
+    
+    def download_file(self, url, file_path, description):
+        """下载文件"""
+        try:
+            print(f"[STATIC] 正在下载 {description}...")
+            
+            import urllib.request
+            import ssl
+            
+            # 创建SSL上下文（忽略证书验证）
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # 下载文件
+            with urllib.request.urlopen(url, context=ssl_context) as response:
+                print(f"[STATIC] 连接到 {url} 成功，开始读取数据...")
+                file_data = response.read()
+                print(f"[STATIC] 数据读取完成，大小: {len(file_data)} 字节")    
+            
+            # 保存文件
+            with open(file_path, 'wb') as f:
+                f.write(file_data)
+            
+            file_size = len(file_data)
+            print(f"[STATIC] ✓ {description} 下载成功 ({self.format_file_size(file_size)})")
+            
+        except Exception as e:
+            print(f"[STATIC] ✗ {description} 下载失败: {e}")
+    
+    def format_file_size(self, size):
+        """格式化文件大小"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.2f} {unit}"
+            size /= 1024.0
+        return f"{size:.2f} TB"
+
     def show_user_manager(self):
         dialog = UserManagerDialog(self.user_manager, self)
         if dialog.exec_() == QDialog.Accepted:
             # 用户已登录，加载用户数据
             self.load_user_settings()
             self.load_directories()
+            # 更新窗口标题显示用户名
+            self.update_window_title()
 
-            # 延迟启动自动扫描，避免登录后立即扫描造成卡顿
-            QTimer.singleShot(3000, self.start_auto_scan)  # 延迟3秒启动
+            # === 修改这里：使用线程安全的状态栏更新 ===
+            self.update_status_bar(f"用户 {self.user_manager.current_user} 登录成功", 3000)
+            
             print(f"[DEBUG] 用户 {self.user_manager.current_user} 已登录，加载用户数据完成")    
-            self.statusBar().showMessage("登录成功，界面已就绪")
+            
+            # 延迟启动自动扫描，避免登录后立即扫描造成卡顿
+            QTimer.singleShot(3000, self.start_auto_scan)
 
-            # 启动自动扫描定时器
-            self.start_auto_scan()
-    
+        
     def load_user_settings(self):
         if not self.user_manager.current_db_path:
             return
@@ -2070,20 +5595,36 @@ class DirectoryScannerApp(QMainWindow):
 
     def scan_single_main_directory(self, path, depth):
         """扫描单个主目录"""
+        # === 新增：线程安全检查 ===
+        if QThread.currentThread() != self.thread():
+            print(f"[ERROR] 扫描操作必须在主线程中执行: {path}")
+            # 使用单次定时器在主线程中重新执行
+            QTimer.singleShot(0, lambda: self.scan_single_main_directory(path, depth))
+            return
+    
         self.main_directory = path
         self.dir_label.setText(f"主目录: {path}")
         
         # 获取当前用户的扫描模式设置
-        scan_mode = "directories"  # 默认值
-        if self.user_manager.current_db_path:
-            conn = sqlite3.connect(self.user_manager.current_db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM settings WHERE key = 'scan_mode'")
-            result = cursor.fetchone()
-            if result:
-                scan_mode = result[0]
-            conn.close()
-        
+        scan_mode = "directories"
+        conn = None
+        try:
+            if self.user_manager.current_db_path:
+                conn = sqlite3.connect(self.user_manager.current_db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM settings WHERE key = 'scan_mode'")
+                result = cursor.fetchone()
+                if result:
+                    scan_mode = result[0]
+        except Exception as e:
+            print(f"[WARNING] 获取扫描模式失败，使用默认值: {e}")
+        finally:
+            if conn:
+                conn.close()
+    
+        # === 修改这里：使用线程安全的状态栏更新 ===
+        self.update_status_bar(f"正在扫描目录: {path}...")
+    
         # === 确保进度条显示 ===
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -2093,6 +5634,9 @@ class DirectoryScannerApp(QMainWindow):
         try:
             # 传入扫描模式参数
             dirs = self.scan_directory_with_depth(path, depth, scan_mode)
+    
+            # === 修改这里：使用线程安全的状态栏更新 ===
+            self.update_status_bar("正在保存到数据库...")
         
             # === 更新进度条 - 扫描完成 ===
             self.progress_bar.setValue(50)
@@ -2221,19 +5765,29 @@ class DirectoryScannerApp(QMainWindow):
                 stats_msg = f"扫描完成: {valid_dirs_count} 个有效目录"
                 if invalid_dirs_count > 0:
                     stats_msg += f", {invalid_dirs_count} 个无效目录被跳过"
+
+                # === 新增：记录扫描完成时间 ===
+                completion_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                stats_msg += f" | 完成时间: {completion_time}"
+
                 self.statusBar().showMessage(stats_msg)
 
+            # === 扫描失败时更新状态栏 ===
         except Exception as e:
-            # === 扫描失败时更新进度条 ===
+            # === 修改这里：使用线程安全的状态栏更新 ===
+            self.update_status_bar("扫描失败", 5000)
+            
             self.progress_bar.setValue(0)
             self.progress_label.setText("扫描失败")
-            self.statusBar().showMessage("扫描失败")
             QMessageBox.critical(self, "扫描错误", f"扫描目录时出错:\n{e}")
             print(f"[ERROR] 扫描错误: {e}")
         finally:
-            if 'conn' in locals():
-                conn.close()
-
+            # === 新增：确保数据库连接正确关闭 ===
+            if 'conn' in locals() and conn:
+                try:
+                    conn.close()
+                except Exception as e:
+                    print(f"[WARNING] 关闭数据库连接时出错: {e}")
         
             # === 新增：扫描完成后隐藏进度条 ===
             QTimer.singleShot(2000, self.hide_progress_bar)  # 2秒后隐藏
@@ -2610,6 +6164,14 @@ class DirectoryScannerApp(QMainWindow):
 
 
     def scan_directories(self):
+        # === 新增：线程安全检查 ===
+        if QThread.currentThread() != self.thread():
+            print("[ERROR] 扫描操作必须在主线程中执行")
+            QMessageBox.warning(self, "线程错误", "扫描操作必须在主线程中执行")
+            # 使用单次定时器在主线程中重新执行
+            QTimer.singleShot(0, self.scan_directories)
+            return
+
         # 检查是否有主目录设置
         if not self.user_manager.current_db_path:
             QMessageBox.warning(self, "未登录", "请先登录用户")
@@ -2626,6 +6188,9 @@ class DirectoryScannerApp(QMainWindow):
         if not main_dirs:
             QMessageBox.warning(self, "无主目录", "请先添加主目录")
             return
+    
+        # === 修改这里：使用线程安全的状态栏更新 ===
+        self.update_status_bar(f"准备扫描 {len(main_dirs)} 个主目录...")
         
         # === 确保进度条显示 ===
         self.progress_bar.setVisible(True)
@@ -2635,7 +6200,10 @@ class DirectoryScannerApp(QMainWindow):
         
         # 扫描每个主目录
         for i, dir_info in enumerate(main_dirs):
-            dir_id, path, depth = dir_info  # 获取已保存的扫描深度
+            dir_id, path, depth = dir_info
+        
+            # === 修改这里：使用线程安全的状态栏更新 ===
+            self.update_status_bar(f"正在扫描: {os.path.basename(path)}... ({i+1}/{len(main_dirs)})")
             
             # 更新进度
             progress_value = int((i) / len(main_dirs) * 100)
@@ -2652,7 +6220,10 @@ class DirectoryScannerApp(QMainWindow):
         # === 完成扫描 ===
         self.progress_bar.setValue(100)
         self.progress_label.setText("所有主目录扫描完成")
-        self.statusBar().showMessage("所有主目录扫描完成")
+    
+        # === 新增：记录扫描完成时间 ===
+        completion_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.update_status_bar(f"所有主目录扫描完成 | 完成时间: {completion_time}", 5000)
         
         # 3秒后隐藏进度条，给用户足够时间看到完成状态
         QTimer.singleShot(3000, self.hide_progress_bar)
@@ -2832,11 +6403,19 @@ class DirectoryScannerApp(QMainWindow):
                 
                 self.table_widget.setItem(row_idx, 3, status_item)
                 
-                # 第五列：目录地址
+                # 第五列：目录地址 - 添加点击功能
                 path_item = QTableWidgetItem(path)
                 path_item.setFlags(path_item.flags() & ~Qt.ItemIsEditable)
-                self.table_widget.setItem(row_idx, 4, path_item)
             
+                # === 新增：为目录地址设置特殊样式和工具提示 ===
+                path_item.setForeground(QBrush(QColor("#0066cc")))  # 蓝色文字
+                path_item.setToolTip(f"点击打开目录: {path}")
+            
+                self.table_widget.setItem(row_idx, 4, path_item)
+        
+            # === 新增：连接单元格点击信号 ===
+            self.table_widget.cellClicked.connect(self.on_table_cell_clicked)
+        
             # 设置表格属性
             self.table_widget.setSelectionBehavior(QTableWidget.SelectRows)
             self.table_widget.setAlternatingRowColors(True)
@@ -2994,9 +6573,10 @@ class DirectoryScannerApp(QMainWindow):
 
 
     def copy_to_clipboard(self, text):
+        """复制文本到剪贴板"""
         clipboard = QApplication.clipboard()
         clipboard.setText(text)
-        self.statusBar().showMessage("路径已复制到剪贴板", 2000)
+        self.update_status_bar("路径已复制到剪贴板", 2000)
 
     def filter_directories(self):
         if not hasattr(self, 'table_widget'):
@@ -3073,36 +6653,54 @@ class DirectoryScannerApp(QMainWindow):
         if not os.path.exists(self.user_manager.current_db_path):
             print(f"[ERROR] 数据库文件不存在: {self.user_manager.current_db_path}")
             return False
+    
+        # === 新增：线程安全检查 ===
+        if not hasattr(self, 'scan_timer'):
+            print("[ERROR] scan_timer 未初始化")
+            return False
         
+        # 确保在主线程中操作定时器
+        if not self.scan_timer.thread() == QThread.currentThread():
+            print("[WARNING] 定时器操作不在主线程，使用信号槽机制")
+            # 使用单次定时器在主线程中重新调用此方法
+            QTimer.singleShot(0, self.start_auto_scan)
+            return False
+            
         # 安全停止现有定时器
         if self.scan_timer.isActive():
-            self.scan_timer.stop()
-            print("[DEBUG] 已停止现有的自动扫描定时器")
+            try:
+                self.scan_timer.stop()
+                print("[DEBUG] 已停止现有的自动扫描定时器")
+            except RuntimeError as e:
+                print(f"[WARNING] 停止定时器时出错: {e}")
         
         # 获取设置值
         interval, auto_scan = self.get_auto_scan_settings()
         
         if auto_scan:
             try:
-                # === 新增：在自动扫描开始时显示进度条 ===
-                def auto_scan_with_progress():
-                    self.progress_bar.setVisible(True)
-                    self.progress_bar.setValue(0)
-                    self.progress_label.setText("自动扫描开始...")
-                    QApplication.processEvents()
-
-                    # 执行扫描
-                    self.scan_directories()
-                    
-                    # 扫描完成后延迟隐藏进度条
-                    QTimer.singleShot(3000, self.hide_progress_bar)
+                # === 新增：延迟启动自动扫描，避免保存设置后立即扫描 ===
+                def delayed_auto_scan():
+                    if not self.scan_timer.isActive():  # 确保定时器没有被手动停止
+                        self.progress_bar.setVisible(True)
+                        self.progress_bar.setValue(0)
+                        self.progress_label.setText("自动扫描开始...")
+                        QApplication.processEvents()
+                        
+                        # 执行扫描
+                        self.scan_directories()
+                        
+                        # 扫描完成后延迟隐藏进度条
+                        QTimer.singleShot(3000, self.hide_progress_bar)
                 
                 # 设置定时器调用带进度条的扫描函数
                 self.scan_timer.timeout.disconnect()
-                self.scan_timer.timeout.connect(auto_scan_with_progress)
-                self.scan_timer.start(interval)
-
-                print(f"[SUCCESS] 自动扫描定时器已启动，间隔: {interval/1000}秒")
+                self.scan_timer.timeout.connect(delayed_auto_scan)
+                
+                # === 新增：延迟10秒后启动第一次扫描，避免立即扫描 ===
+                QTimer.singleShot(60000, lambda: self.scan_timer.start(interval) if auto_scan else None)
+                
+                print(f"[SUCCESS] 自动扫描定时器已启动，将在60秒后开始第一次扫描，间隔: {interval/1000}秒")
                 return True
             except Exception as e:
                 print(f"[ERROR] 启动自动扫描定时器失败: {e}")
@@ -3314,7 +6912,6 @@ class DirectoryScannerApp(QMainWindow):
         total_items_processed = 0
         estimated_total = 1000  # 预估总数，会在扫描过程中调整
     
-        
         # 使用队列进行广度优先搜索
         from collections import deque
         queue = deque([(root_dir, 0)])  # (path, current_depth)
@@ -3361,7 +6958,25 @@ class DirectoryScannerApp(QMainWindow):
                     should_add = True
                 elif scan_mode == "both":
                     should_add = True
-                
+            
+                # === 新增：如果是目录，检查是否为空目录 ===
+                if should_add and is_dir:
+                    # 检查目录是否为空
+                    try:
+                        dir_contents = os.listdir(current_path)
+                        # 过滤掉隐藏文件和系统文件
+                        visible_contents = [item for item in dir_contents 
+                                        if not item.startswith('.') and not item.startswith('~')]
+                        
+                        # 如果是空目录，跳过不添加到列表
+                        if not visible_contents:
+                            print(f"[DEBUG] 跳过空白目录: {current_path}")
+                            should_add = False
+                    except (PermissionError, FileNotFoundError):
+                        # 如果无法访问目录内容，也跳过
+                        print(f"[DEBUG] 跳过无法访问的目录: {current_path}")
+                        should_add = False
+            
                 # 加强数据验证：确保路径和名称有效
                 if should_add:
                     name = os.path.basename(current_path)
@@ -3474,7 +7089,13 @@ class DirectoryScannerApp(QMainWindow):
                 Qt.KeepAspectRatio, 
                 Qt.SmoothTransformation
             )
-            
+        
+            # === 新增：确保图片数据正确释放 ===
+            # 强制垃圾回收以释放图片资源
+            del pixmap
+            import gc
+            gc.collect()
+        
             return scaled_pixmap
             
         except Exception as e:
@@ -3799,6 +7420,11 @@ class DirectoryScannerApp(QMainWindow):
             print(f"[DEBUG] 封面图片不存在: {cover_image_path}")
             return False
 
+        # === 新增：检查目录是否为空或没有图片 ===
+        if not self.has_images_in_directory(directory_path):
+            print(f"[DEBUG] 跳过空白目录或没有图片的目录: {directory_path}")
+            return False
+
         # 检查并确保保存目录
         success, cover_save_dir = self.ensure_cover_save_directory()
         if not success:
@@ -3974,6 +7600,8 @@ class DirectoryScannerApp(QMainWindow):
             failed_count = 0
             error_details = []
 
+            self.update_status_bar("正在批量保存封面...")
+
             # 创建进度对话框
             progress_dialog = QProgressDialog("正在批量保存封面...", "取消", 0, total_count, self)
             progress_dialog.setWindowTitle("批量保存封面")
@@ -3988,6 +7616,8 @@ class DirectoryScannerApp(QMainWindow):
                 progress_dialog.setLabelText(f"正在处理: {os.path.basename(dir_path)}... ({i+1}/{total_count})")
                 QApplication.processEvents()
                 
+                self.update_status_bar(f"批量保存封面: {i+1}/{total_count}")
+
                 if os.path.exists(dir_path):
                     cover_path = self.find_cover_image(dir_path)
                     if cover_path and os.path.exists(cover_path):
@@ -4013,6 +7643,11 @@ class DirectoryScannerApp(QMainWindow):
             
             progress_dialog.close()
 
+            # === 修改这里：使用线程安全的状态栏更新 ===
+            completion_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.update_status_bar(f"批量保存完成 - 成功 {saved_count} 个目录 | 完成时间: {completion_time}", 5000)
+
+
             # 显示详细结果
             result_msg = f"批量保存完成！\n成功: {saved_count} 个\n失败: {failed_count} 个"
             
@@ -4035,9 +7670,13 @@ class DirectoryScannerApp(QMainWindow):
                     result_msg += f"\n\n详细错误日志已保存到: {log_file}"
                 except Exception as e:
                     print(f"[ERROR] 保存错误日志失败: {e}")
-            
+
+            # === 新增：记录批量保存完成时间 ===
+            completion_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            result_msg += f"\n\n完成时间: {completion_time}"
+
             QMessageBox.information(self, "批量保存完成", result_msg)
-            self.statusBar().showMessage(f"批量保存完成 - 成功 {saved_count} 个目录")
+            self.statusBar().showMessage(f"批量保存完成 - 成功 {saved_count} 个目录 | 完成时间: {completion_time}")
             
         except Exception as e:
             print(f"[ERROR] 批量保存封面时出错: {e}")
@@ -4108,9 +7747,12 @@ class DirectoryScannerApp(QMainWindow):
                         if cover_path and os.path.exists(cover_path):
                             if self.save_cover_image(dir_path, cover_path):
                                 saved_count += 1
-            
-            QMessageBox.information(self, "保存完成", f"成功保存 {saved_count} 个缺失封面")
-            self.statusBar().showMessage(f"缺失封面保存完成 - 成功 {saved_count} 个")
+
+            # === 新增：记录保存完成时间 ===
+            completion_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+           
+            QMessageBox.information(self, "保存完成", f"成功保存 {saved_count} 个缺失封面\n完成时间: {completion_time}")
+            self.statusBar().showMessage(f"缺失封面保存完成 - 成功 {saved_count} 个 | 完成时间: {completion_time}")
             
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"保存缺失封面时出错:\n{e}")
@@ -4305,13 +7947,740 @@ class DirectoryScannerApp(QMainWindow):
         return thumbnail_click_handler
 
     def show_scan_progress(self, message, value=None):
-        """显示扫描进度"""
+        """显示扫描进度 - 线程安全版本"""
+        # === 新增：线程安全检查 ===
+        if QThread.currentThread() != self.thread():
+            # 如果不在主线程，使用信号槽机制
+            QMetaObject.invokeMethod(self, "show_scan_progress", 
+                                Qt.QueuedConnection,
+                                Q_ARG(str, message),
+                                Q_ARG(int, value) if value is not None else Q_ARG(int, -1))
+            return
+        
         self.progress_bar.setVisible(True)
         if value is not None:
             self.progress_bar.setValue(value)
         self.progress_label.setText(message)
         QApplication.processEvents()
 
+    def update_status_bar(self, message, timeout=0):
+        """线程安全的状态栏更新"""
+        if QThread.currentThread() != self.thread():
+            QMetaObject.invokeMethod(self.statusBar(), "showMessage",
+                                Qt.QueuedConnection,
+                                Q_ARG(str, message),
+                                Q_ARG(int, timeout))
+        else:
+            self.statusBar().showMessage(message, timeout)
+
+    def has_images_in_directory(self, directory_path):
+        """检查目录是否包含图片文件"""
+        if not os.path.isdir(directory_path):
+            return False
+        
+        image_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp']
+        
+        try:
+            # 检查目录是否为空
+            contents = os.listdir(directory_path)
+            if not contents:
+                return False  # 空目录
+            
+            # 检查是否有图片文件
+            for file in contents:
+                full_path = os.path.join(directory_path, file)
+                if os.path.isfile(full_path):
+                    if any(file.lower().endswith(ext) for ext in image_extensions):
+                        return True  # 找到至少一个图片文件
+            
+
+            return False  # 没有找到图片文件
+            
+        except (PermissionError, FileNotFoundError):
+            return False  # 无法访问的目录
+
+    def update_window_title(self):
+        """更新窗口标题，包含用户名信息和登录时间"""
+        base_title = f"{ProjectInfo.NAME} {ProjectInfo.VERSION} (Build: {ProjectInfo.BUILD_DATE})"
+        
+        if self.user_manager.current_user:
+            # 获取当前日期和时间
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            title = f"{base_title} - 用户: {self.user_manager.current_user} - 登录时间: {current_time}"
+        else:
+            title = f"{base_title} - 未登录"
+        
+        self.setWindowTitle(title)
+
+    def on_table_cell_clicked(self, row, column):
+        """处理表格单元格点击事件"""
+        if column == 4:  # 目录地址列
+            path_item = self.table_widget.item(row, column)
+            if path_item:
+                directory_path = path_item.text()
+                
+                # === 注意：这里直接使用表格中的路径，这已经是数据库中的路径 ===
+                print(f"[DEBUG] 使用数据库路径打开目录: {directory_path}")
+                
+                # === 新增：路径转义处理 ===
+                # 修复反斜杠转义问题
+                directory_path = directory_path.replace('\\', '\\\\')
+                
+                # === 新增：网络路径检查 ===
+                normalized_path = self.normalize_path(directory_path)
+                if normalized_path.startswith('//'):
+                    # 检查网络连通性
+                    is_connected, message = self.check_network_connectivity(normalized_path)
+                    if not is_connected:
+                        reply = QMessageBox.question(
+                            self, "网络连接问题",
+                            f"{message}\n\n是否仍然尝试打开？",
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.No
+                        )
+                        if reply == QMessageBox.No:
+                            return
+                
+                # 调用打开目录方法
+                self.open_directory(directory_path)
+
+
+
+
+    def normalize_path(self, path):
+        """规范化路径，统一分隔符并处理网络路径"""
+        if not path:
+            return path
+        
+        # 将反斜杠统一为正斜杠
+        normalized_path = path.replace('\\', '/')
+        
+        # 处理网络路径格式
+        if normalized_path.startswith('//'):
+            # 确保网络路径格式正确
+            if not normalized_path.startswith('//'):
+                normalized_path = '//' + normalized_path.lstrip('/')
+        
+        return normalized_path
+
+    from PyQt5.QtCore import pyqtSlot
+    
+    # 在 DirectoryScannerApp 类中的 open_directory 方法前添加：
+    @pyqtSlot(str)
+    def open_directory(self, directory_path):
+        """打开指定目录 - 增强版本，支持网络路径和错误处理（线程安全）"""
+        print(f"[DEBUG] 请求打开目录1: {directory_path}")
+        if not directory_path:
+            QMessageBox.warning(self, "路径为空", "目录路径为空")
+            return False
+        
+        print(f"[DEBUG] 打开目录原始路径1: {directory_path}")
+        
+        # === 新增：统一路径分隔符 ===
+        directory_path = self.normalize_path_separators(directory_path)
+        print(f"[DEBUG] 规范化后路径: {directory_path}")
+        
+        # 原有的其他代码保持不变...
+        original_path = directory_path
+        
+        # 如果是网络路径，使用专门的规范化方法
+        if directory_path.startswith('\\\\'):
+            directory_path = self.normalize_network_path(directory_path)
+        
+        # === 新增：网络路径特殊处理 ===
+        is_network_path = directory_path.startswith('\\\\')
+        
+        if is_network_path:
+            print(f"[DEBUG] 检测到网络路径: {directory_path}")
+            
+            # 首先尝试直接打开
+            success = self.open_network_path_direct(directory_path)
+            if not success:
+                # 如果直接打开失败，尝试备用方案
+                success = self.open_network_path_alternative(directory_path)
+            
+            if success:
+                self.update_status_bar(f"正在打开网络路径: {directory_path}", 3000)
+            else:
+                self.update_status_bar(f"网络路径打开失败: {directory_path}", 5000)
+            
+            return success
+        
+        # === 原有的本地路径处理逻辑 ===
+        # 修复路径分隔符问题
+        import re
+        
+        # 修复模式：中文字符后紧跟英文字符的情况
+        pattern = r'([\u4e00-\u9fff])([a-zA-Z])'
+        fixed_path = re.sub(pattern, r'\1/\2', directory_path)
+        
+        if fixed_path != directory_path:
+            print(f"[DEBUG] 路径修复: {directory_path} -> {fixed_path}")
+            directory_path = fixed_path
+        
+        # 规范化路径
+        normalized_path = self.normalize_path(directory_path)
+        
+        # 检查路径是否存在
+        print(f"[DEBUG] 试图打开目录: {normalized_path}")
+        if not os.path.exists(normalized_path):
+            print(f"[DEBUG] 目录不存在: {normalized_path}")
+            
+            # 提供手动修复选项
+            reply = QMessageBox.question(
+                self, "目录不存在", 
+                f"无法找到目录:\n{normalized_path}\n\n是否手动选择正确目录？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Yes:
+                # 让用户手动选择目录
+                manual_dir = QFileDialog.getExistingDirectory(
+                    self, "选择正确的目录", 
+                    os.path.dirname(original_path) if os.path.dirname(original_path) else "."
+                )
+                if manual_dir:
+                    return self.open_directory(manual_dir)
+            
+            return False
+        
+        # 原有的打开目录逻辑
+        try:
+            # 跨平台打开目录的方法
+            if sys.platform == "win32":
+                # Windows - 直接使用路径
+                print(f"[DEBUG] Windows路径: {normalized_path}")
+                os.startfile(normalized_path)
+            elif sys.platform == "darwin":
+                # macOS
+                subprocess.run(["open", normalized_path], check=True)
+            else:
+                # Linux
+                subprocess.run(["xdg-open", normalized_path], check=True)
+        
+            # === 新增：打印数据库对应数据 ===
+            self.print_database_data_for_directory(normalized_path)
+
+            self.update_status_bar(f"已打开目录: {normalized_path}", 3000)
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            self.update_status_bar(f"打开目录失败: {e}", 5000)
+            print(f"[ERROR] 打开目录失败: {e}")
+            QMessageBox.critical(self, "打开目录失败", f"无法打开目录:\n{normalized_path}\n错误: {e}")
+            return False
+        except Exception as e:
+            self.update_status_bar(f"打开目录失败: {e}", 5000)
+            print(f"[ERROR] 打开目录失败: {e}")
+            QMessageBox.critical(self, "打开目录失败", f"无法打开目录:\n{normalized_path}\n错误: {e}")
+            return False
+
+
+
+
+
+
+
+    def open_network_path_direct(self, network_path):
+        """直接打开网络路径"""
+        try:
+            if sys.platform == "win32":
+                print(f"[DEBUG] 尝试直接打开Windows网络路径: {network_path}")
+                # 使用Popen而不是run，避免等待
+                subprocess.Popen(['explorer', network_path], 
+                            stdout=subprocess.DEVNULL, 
+                            stderr=subprocess.DEVNULL)
+                return True
+            else:
+                # 其他系统转换为正斜杠
+                unix_path = network_path.replace('\\\\', '//').replace('\\', '/')
+                subprocess.Popen(["xdg-open", unix_path], 
+                            stdout=subprocess.DEVNULL, 
+                            stderr=subprocess.DEVNULL)
+                return True
+        except Exception as e:
+            print(f"[DEBUG] 直接打开网络路径失败: {e}")
+            return False
+
+
+    def open_network_path(self, network_path):
+        """专门处理网络路径"""
+        try:
+            if sys.platform == "win32":
+                # Windows 网络路径 - 使用反斜杠
+                windows_network_path = network_path.replace('/', '\\')
+                subprocess.run(['explorer', windows_network_path], check=True)
+            else:
+                # 其他系统尝试用文件管理器打开
+                subprocess.run(["xdg-open", network_path], check=True)
+                
+            self.statusBar().showMessage(f"正在打开网络路径: {network_path}", 3000)
+            return True
+        except Exception as e:
+            print(f"[DEBUG] 网络路径打开失败，尝试备用方案: {e}")
+            return self.open_network_path_alternative(network_path)
+
+    def open_network_path_alternative(self, network_path):
+        """网络路径备用打开方案 - 增强版本"""
+        print(f"[DEBUG] 网络路径打开失败，尝试备用方案: {network_path}")
+        
+        try:
+            if sys.platform == "win32":
+                # 方案1: 使用start命令（已存在）
+                windows_network_path = network_path.replace('/', '\\')
+                print(f"[DEBUG] 尝试Windows网络路径: {windows_network_path}")
+                
+                # 方案2: 直接使用explorer并捕获错误
+                try:
+                    result = subprocess.run(['explorer', windows_network_path], 
+                                        capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0:
+                        return True
+                    else:
+                        print(f"[DEBUG] explorer命令返回非零状态: {result.returncode}")
+                except subprocess.TimeoutExpired:
+                    print(f"[DEBUG] explorer命令超时，但可能已成功")
+                    return True  # 超时也可能表示已成功打开
+                
+                # 方案3: 使用start命令（shell方式）
+                try:
+                    subprocess.run(['start', '', windows_network_path], 
+                                shell=True, timeout=10)
+                    print(f"[DEBUG] start命令执行完成")
+                    return True  # start命令通常立即返回
+                except subprocess.TimeoutExpired:
+                    print(f"[DEBUG] start命令超时，但可能已成功")
+                    return True
+                
+                # 方案4: 尝试映射网络驱动器方式（如果路径格式支持）
+                if '\\' in windows_network_path and windows_network_path.count('\\') >= 3:
+                    try:
+                        # 提取服务器和共享名
+                        parts = windows_network_path.split('\\')
+                        if len(parts) >= 4:
+                            server = parts[2]
+                            share = parts[3]
+                            drive_letter = self.find_available_drive_letter()
+                            if drive_letter:
+                                # 尝试映射网络驱动器
+                                map_cmd = f'net use {drive_letter}: \\\\{server}\\{share}'
+                                subprocess.run(map_cmd, shell=True, timeout=5)
+                                
+                                # 构建映射后的路径
+                                mapped_path = f"{drive_letter}:\\" + "\\".join(parts[4:])
+                                subprocess.run(['explorer', mapped_path], timeout=10)
+                                
+                                # 稍后断开映射
+                                QTimer.singleShot(5000, lambda: subprocess.run(f'net use {drive_letter}: /delete', shell=True))
+                                return True
+                    except Exception as e:
+                        print(f"[DEBUG] 网络驱动器映射失败: {e}")
+            
+            elif sys.platform == "darwin":
+                # macOS
+                subprocess.run(['open', network_path], check=True, timeout=10)
+                return True
+            else:
+                # Linux - 尝试不同的文件管理器
+                file_managers = ['nautilus', 'dolphin', 'thunar', 'pcmanfm', 'nemo']
+                for manager in file_managers:
+                    try:
+                        subprocess.run([manager, network_path], check=True, timeout=10)
+                        return True
+                    except:
+                        continue
+                        
+            # 如果所有方法都失败，显示路径让用户手动操作
+            return self.show_manual_open_dialog(network_path)
+            
+        except subprocess.TimeoutExpired:
+            print(f"[DEBUG] 备用方案超时，但可能已成功: {network_path}")
+            return True  # 超时也可能表示已成功打开
+        except Exception as e:
+            print(f"[DEBUG] 备用方案也失败: {e}")
+            return self.show_manual_open_dialog(network_path)
+
+    def find_available_drive_letter(self):
+        """查找可用的驱动器字母（Windows）"""
+        if sys.platform != "win32":
+            return None
+        
+        try:
+            # 获取已使用的驱动器
+            import string
+            used_drives = set()
+            for letter in string.ascii_uppercase:
+                if os.path.exists(f"{letter}:"):
+                    used_drives.add(letter)
+            
+            # 从Z开始反向查找可用驱动器
+            for letter in reversed(string.ascii_uppercase):
+                if letter not in used_drives and letter not in ['A', 'B', 'C']:  # 避免系统盘
+                    return letter
+        except:
+            pass
+        
+        return None
+
+
+    def show_manual_open_dialog(self, path):
+        """显示手动打开对话框"""
+        reply = QMessageBox.information(
+            self, 
+            "无法自动打开", 
+            f"路径: {path}\n\n无法自动打开，请手动在文件管理器中访问此路径。\n是否复制路径到剪贴板？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.copy_to_clipboard(path)
+        return False
+
+
+    def check_network_connectivity(self, network_path):
+        """检查网络连接性 - 可选方案：添加设置控制"""
+        try:
+            # 检查是否启用了网络连通性检查
+            enable_network_check = self.get_setting('enable_network_check', '0') == '1'
+            if not enable_network_check:
+                return True, "跳过网络检查"  # 默认跳过检查
+                
+            # 提取主机名
+            if network_path.startswith('//'):
+                parts = network_path[2:].split('/')
+                hostname = parts[0] if parts else ''
+                
+                # 使用ping检查网络连通性 - 隐藏窗口
+                if sys.platform == "win32":
+                    result = subprocess.run(['ping', '-n', '1', hostname], 
+                                        capture_output=True, text=True,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                else:
+                    result = subprocess.run(['ping', '-c', '1', hostname], 
+                                        stdout=subprocess.DEVNULL, 
+                                        stderr=subprocess.DEVNULL)
+                
+                if result.returncode == 0:
+                    return True, f"网络设备 {hostname} 可达"
+                else:
+                    return False, f"无法连接到网络设备 {hostname}"
+                        
+        except Exception as e:
+            return False, f"网络检查失败: {e}"
+        
+        return False, "无法解析网络路径"
+
+
+    # 服务器相关方法
+    def init_server(self):
+        """初始化服务器"""
+        self.server = DirectoryScannerServer(self, host='0.0.0.0', port=8080)
+        self.server_status = False
+
+    def toggle_server(self):
+        """切换服务器状态"""
+        if not hasattr(self, 'server'):
+            self.init_server()
+        
+        if self.server_status:
+            self.stop_server()
+        else:
+            self.start_server()
+
+    def start_server(self):
+        """启动服务器"""
+        if hasattr(self, 'server') and self.server.start():
+            self.server_status = True
+
+            self.update_server_status_display()
+
+            self.server_action.setText("停止Web服务器")
+            self.server_action.setIcon(QIcon.fromTheme("network-server"))
+            
+            server_url = self.server.get_server_url()
+            self.update_status_bar(f"Web服务器已启动: {server_url}", 5000)
+            
+            # 只在手动启动时显示信息对话框，自动启动时不显示
+            if not hasattr(self, '_auto_started') or not self._auto_started:
+                self.show_server_info()
+            
+            return True
+        else:
+            if not hasattr(self, '_auto_started') or not self._auto_started:
+                QMessageBox.critical(self, "服务器错误", "无法启动Web服务器")
+                self.update_status_bar("Web服务器启动失败", 5000)
+            return False
+
+
+    def stop_server(self):
+        """停止服务器"""
+        if hasattr(self, 'server') and self.server_status:
+            self.server.stop()
+            self.server_status = False
+            self.server_action.setText("启动Web服务器")
+            self.server_action.setIcon(QIcon.fromTheme("network-server"))
+            self.statusBar().showMessage("Web服务器已停止")
+            self.update_server_status_display()
+            self.update_status_bar("Web服务器已停止", 3000)
+
+    def show_server_info(self):
+        """显示服务器信息"""
+        if not self.server_status:
+            return
+        
+        server_url = self.server.get_server_url()
+        
+        message = f"""
+    Web服务器已启动！
+
+    访问地址: {server_url}
+
+    功能特性:
+    • 📁 查看所有目录和文件
+    • 🔍 搜索目录（支持拼音首字母）
+    • 🖼️ 查看封面图片
+    • 📂 一键打开目录
+    • 🔄 远程扫描目录
+    • 📱 响应式设计，支持手机访问
+
+    注意:
+    • 服务器运行在: {server_url}
+    • 同一网络下的其他设备也可以访问
+    • 点击"停止Web服务器"可关闭服务
+    """
+        
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Web服务器信息")
+        msg_box.setText(message)
+        msg_box.addButton("复制访问地址", QMessageBox.ActionRole)
+        msg_box.addButton("在浏览器中打开", QMessageBox.ActionRole)
+        msg_box.addButton("确定", QMessageBox.AcceptRole)
+        
+        result = msg_box.exec_()
+        
+        if result == 0:  # 复制访问地址
+            QApplication.clipboard().setText(server_url)
+            self.statusBar().showMessage("访问地址已复制到剪贴板")
+        elif result == 1:  # 在浏览器中打开
+            import webbrowser
+            webbrowser.open(server_url)
+
+    def closeEvent(self, event):
+        """重写关闭事件，确保服务器正确停止"""
+        if hasattr(self, 'server') and self.server_status:
+            self.stop_server()
+        event.accept()
+
+
+
+    def auto_start_web_server(self):
+        """自动启动Web服务器"""
+        auto_start = self.get_setting('auto_start_server', '1') == '1'
+        
+        if auto_start:
+            print("[SERVER] 自动启动Web服务器...")
+            self._auto_started = True
+            if self.start_server():
+                self.update_status_bar("Web服务器已自动启动", 3000)
+            else:
+                self.update_status_bar("Web服务器启动失败", 3000)
+            self._auto_started = False
+
+    def update_server_status_display(self):
+        """更新服务器状态显示"""
+        if self.server_status:
+            # 服务器运行中
+            self.server_status_indicator.setText("🟢 服务器运行中")
+            self.server_status_indicator.setStyleSheet("""
+                QLabel {
+                    padding: 5px 10px;
+                    border: 1px solid #4caf50;
+                    border-radius: 10px;
+                    background-color: #e8f5e8;
+                    color: #2e7d32;
+                    font-weight: bold;
+                }
+            """)
+            
+            server_url = self.server.get_server_url()
+            self.status_server_info.setText(f"服务器: {server_url}")
+            
+            # 更新服务器动作文本
+            self.server_action.setText("停止Web服务器")
+            self.server_action.setIcon(QIcon.fromTheme("network-server-disconnect"))
+        else:
+            # 服务器停止
+            self.server_status_indicator.setText("🔴 服务器离线")
+            self.server_status_indicator.setStyleSheet("""
+                QLabel {
+                    padding: 5px 10px;
+                    border: 1px solid #ccc;
+                    border-radius: 10px;
+                    background-color: #ffebee;
+                    color: #c62828;
+                    font-weight: bold;
+                }
+            """)
+            
+            self.status_server_info.setText("服务器: 未启动")
+            
+            # 更新服务器动作文本
+            self.server_action.setText("启动Web服务器")
+            self.server_action.setIcon(QIcon.fromTheme("network-server"))
+        
+        # 强制刷新显示
+        self.server_status_indicator.update()
+        self.status_server_info.update()
+
+    def normalize_network_path(self, path):
+        """规范化网络路径，统一使用反斜杠（Windows）"""
+        if not path:
+            return path
+        
+        print(f"[DEBUG] 原始路径: {path}")
+        
+        # Windows系统使用反斜杠
+        if sys.platform == "win32":
+            normalized_path = path.replace('/', '\\')
+            # 确保网络路径以双反斜杠开头
+            if normalized_path.startswith('\\\\'):
+                # 清理路径中的多余反斜杠
+                parts = [part for part in normalized_path.split('\\') if part]
+                if parts:
+                    normalized_path = '\\\\' + '\\'.join(parts)
+        else:
+            # Linux/macOS 使用正斜杠
+            normalized_path = path.replace('\\', '/')
+            if normalized_path.startswith('//'):
+                parts = [part for part in normalized_path.split('/') if part]
+                if parts:
+                    normalized_path = '//' + '/'.join(parts)
+        
+        print(f"[DEBUG] 规范化后路径: {normalized_path}")
+        return normalized_path
+
+
+
+    def normalize_path_separators(self, path):
+        """统一路径分隔符，将正斜杠转换为反斜杠（Windows系统）"""
+        if not path:
+            return path
+        
+        # Windows系统使用反斜杠
+        if sys.platform == "win32":
+            normalized_path = path.replace('/', '\\')
+            # 确保网络路径格式正确
+            if normalized_path.startswith('\\\\'):
+                # 对于网络路径，确保格式正确
+                normalized_path = '\\\\' + normalized_path[2:].replace('\\\\', '\\')
+            return normalized_path
+        else:
+            # Linux/macOS 使用正斜杠
+            return path.replace('\\', '/')
+
+
+    def normalize_path_for_os(self, path):
+        """根据当前操作系统规范化路径分隔符"""
+        if not path:
+            return path
+        
+        if sys.platform == "win32":
+            # Windows 使用反斜杠
+            return path.replace('/', '\\')
+        else:
+            # Linux/macOS 使用正斜杠
+            return path.replace('\\', '/')
+
+    def print_database_data_for_directory(self, directory_path):
+        """打印数据库中对应目录的数据"""
+        if not self.user_manager.current_db_path:
+            print("[INFO] 未登录用户，无法查询数据库")
+            return
+        
+        try:
+            conn = sqlite3.connect(self.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            # 查询数据库中该目录的信息
+            cursor.execute("""
+                SELECT name, path, directory_exists, created_time, last_modified, is_directory, last_scanned
+                FROM directories 
+                WHERE path = ?
+            """, (directory_path,))
+            
+            result = cursor.fetchone()
+            
+            if result:
+                name, path, exists, created_time, last_modified, is_directory, last_scanned = result
+                print("=" * 50)
+                print("数据库对应数据:")
+                print(f"目录名称: {name}")
+                print(f"完整路径: {path}")
+                print(f"是否存在: {'是' if exists else '否'}")
+                print(f"创建时间: {created_time}")
+                print(f"最后修改: {last_modified}")
+                print(f"是否目录: {'是' if is_directory else '否'}")
+                print(f"最后扫描: {last_scanned}")
+                print("=" * 50)
+            else:
+                print(f"[INFO] 数据库中未找到目录: {directory_path}")
+            
+            conn.close()
+            
+        except Exception as e:
+            print(f"[ERROR] 查询数据库失败: {e}")
+
+    def get_database_path_for_item(self, post_path):
+        """根据POST路径查询数据库中的正确路径"""
+        print(f"[DATABASE PATH] 查询数据库路径 for: {post_path}")
+        if not self.user_manager.current_db_path:
+            return None
+        
+        try:
+            conn = sqlite3.connect(self.user_manager.current_db_path)
+            cursor = conn.cursor()
+            
+            # 多种查询策略
+            basename = os.path.basename(post_path)
+            print(f"[DATABASE PATH] 目录名称: {basename}")
+            
+            # 策略1: 精确匹配名称
+            cursor.execute("SELECT path FROM directories WHERE name = ?", (basename,))
+            results = cursor.fetchall()
+            print(f"[DATABASE PATH] 策略1结果数: {len(results)}")
+            
+            # 策略2: 路径包含匹配
+            if not results:
+                cursor.execute("SELECT path FROM directories WHERE path LIKE ?", (f"%{basename}%",))
+                results = cursor.fetchall()
+                print(f"[DATABASE PATH] 策略2结果数: {len(results)}")   
+            
+            # 策略3: 路径结尾匹配
+            if not results:
+                cursor.execute("SELECT path FROM directories WHERE path LIKE ?", (f"%{basename}",))
+                results = cursor.fetchall()
+                print(f"[DATABASE PATH] 策略3结果数: {len(results)}")
+            
+            conn.close()
+            
+            if results:
+                # 优先选择路径最匹配的结果
+                for result in results:
+                    db_path = result[0]
+                    if db_path.endswith(basename):
+                        print(f"[DATABASE PATH] 找到匹配的数据库路径: {db_path}")
+                        return db_path
+                
+                # 返回第一个结果
+                db_path = results[0][0]
+                print(f"[DATABASE PATH] 使用第一个数据库路径: {db_path}")
+                return db_path
+            
+            return None
+            
+        except Exception as e:
+            print(f"[DATABASE ERROR] 查询数据库路径失败: {e}")
+            return None
 
 
 # 主程序
@@ -4330,5 +8699,8 @@ if __name__ == "__main__":
     # 创建主窗口
     window = DirectoryScannerApp()
     window.show()
+    
+    # 初始化服务器（但不自动启动）
+    window.init_server()
     
     sys.exit(app.exec_())
