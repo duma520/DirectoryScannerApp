@@ -1,0 +1,74 @@
+<?xml version='1.0' encoding='utf8'?>
+<nuitka-compilation-report nuitka_version="4.0.7" nuitka_commercial_version="not installed" mode="standalone" completion="error exit message (1)" exit_message="pyside6: Error, there is no Qt plugin family 'sql' (only OrderedSet(['assetimporters', 'canbus', 'designer', 'generic', 'geometryloaders', 'geoservices', 'iconengines', 'imageformats', 'multimedia', 'networkinformation', 'platforminputcontexts', 'platforms', 'position', 'qmllint', 'qmltooling', 'renderers', 'renderplugins', 'sceneparsers', 'scxmldatamodel', 'sensors', 'sqldrivers', 'styles', 'texttospeech', 'tls', 'webview'])).">
+  <performance>
+    <memory_usage name="after_launch" value="36409344" />
+  </performance>
+  <data_composer blob_size="None" />
+  <command_line>
+    <option value="--standalone" />
+    <option value="--enable-plugin=pyside6" />
+    <option value="--windows-console-mode=disable" />
+    <option value="--windows-icon-from-ico=icon.ico" />
+    <option value="--include-data-files=icon.ico=icon.ico" />
+    <option value="--include-data-dir=static=static" />
+    <option value="--include-module=pypinyin" />
+    <option value="--include-module=PySide6.QtSql" />
+    <option value="--include-module=sqlite3" />
+    <option value="--include-module=fitz" />
+    <option value="--include-module=pdf2image" />
+    <option value="--include-package=PySide6" />
+    <option value="--include-package=shiboken6" />
+    <option value="--include-package=pypinyin" />
+    <option value="--nofollow-import-to=torch" />
+    <option value="--nofollow-import-to=torchvision" />
+    <option value="--nofollow-import-to=tensorflow" />
+    <option value="--nofollow-import-to=cupy" />
+    <option value="--nofollow-import-to=Cython" />
+    <option value="--follow-imports" />
+    <option value="--jobs=4" />
+    <option value="--clang" />
+    <option value="--remove-output" />
+    <option value="--output-dir=build_output" />
+    <option value="--windows-disable-console" />
+    <option value="--include-qt-plugins=sql,imageformats,platforms,styles" />
+    <option value="--include-qt-plugins=PySide6.plugins.sql" />
+    <option value="--noinclude-qt-plugins=PySide6.plugins.virtualkeyboard" />
+    <option value="DirectoryScannerApp.py" />
+  </command_line>
+  <plugins>
+    <plugin name="anti-bloat" user_enabled="no" />
+    <plugin name="data-files" user_enabled="no" />
+    <plugin name="delvewheel" user_enabled="no" />
+    <plugin name="dll-files" user_enabled="no" />
+    <plugin name="eventlet" user_enabled="no" />
+    <plugin name="gevent" user_enabled="no" />
+    <plugin name="gi" user_enabled="no" />
+    <plugin name="glfw" user_enabled="no" />
+    <plugin name="implicit-imports" user_enabled="no" />
+    <plugin name="kivy" user_enabled="no" />
+    <plugin name="matplotlib" user_enabled="no" />
+    <plugin name="multiprocessing" user_enabled="no" />
+    <plugin name="options-nanny" user_enabled="no" />
+    <plugin name="pbr-compat" user_enabled="no" />
+    <plugin name="pkg-resources" user_enabled="no" />
+    <plugin name="playwright" user_enabled="no" />
+    <plugin name="pyside6" user_enabled="yes" />
+    <plugin name="pywebview" user_enabled="no" />
+    <plugin name="spacy" user_enabled="no" />
+    <plugin name="transformers" user_enabled="no" />
+  </plugins>
+  <distributions />
+  <python python_exe="${sys.prefix}\python.exe" python_flavor="CPython Official" python_version="3.10.11" os_name="Windows" os_release="10" arch_name="x86_64" filesystem_encoding="utf-8">
+    <search_path>
+      <path value="${cwd}" />
+      <path value="${sys.prefix}\DLLs" />
+      <path value="${sys.prefix}\lib" />
+      <path value="${sys.prefix}" />
+      <path value="${sys.prefix}\lib\site-packages" />
+      <path value="${sys.prefix}\lib\site-packages\win32" />
+      <path value="${sys.prefix}\lib\site-packages\win32\lib" />
+      <path value="${sys.prefix}\lib\site-packages\Pythonwin" />
+    </search_path>
+  </python>
+  <output />
+</nuitka-compilation-report>
